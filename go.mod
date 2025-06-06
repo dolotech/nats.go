@@ -1,4 +1,4 @@
-module nats.go
+module natspool
 
 go 1.24.2
 
