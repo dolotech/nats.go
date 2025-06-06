@@ -1,4 +1,4 @@
-module natspool
+module github.com/dolotech/nats.go
 
 go 1.24.2
 
