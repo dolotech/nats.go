@@ -56,7 +56,7 @@ func NewSubscriber(servers []string, opts ...nats.Option) (*Subscriber, error) {
 	copy(s, servers)
 	rand.Shuffle(len(s), func(i, j int) { s[i], s[j] = s[j], s[i] })
 
-	maxWorkers := runtime.GOMAXPROCS(0) * 4 // 默认并发度，可根据业务规模调整
+	maxWorkers := runtime.GOMAXPROCS(0) * 32 // 默认并发度，可根据业务规模调整
 	sub := &Subscriber{
 		ctx:    ctx,
 		cancel: cancel,
