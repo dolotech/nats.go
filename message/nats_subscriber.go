@@ -161,6 +161,49 @@ func (s *Subscriber) Subscribe(subj string, h nats.MsgHandler) error {
 	return nil
 }
 
+// QueueSubscribe 队列订阅（服务器端负载均衡）。
+func (s *Subscriber) QueueSubscribeGo(subj, queue string, h nats.MsgHandler) error {
+	if s.closed.Load() {
+		return errors.New("subscriber: closed")
+	}
+	zap.S().Debugf("队列订阅开始: %s [%s]", subj, queue)
+	sub, err := s.Conn.QueueSubscribe(subj, queue, s.wrapgo(subj, h))
+	if err != nil {
+		return err
+	}
+	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	return nil
+}
+
+// Subscribe 普通订阅。
+func (s *Subscriber) SubscribeGo(subj string, h nats.MsgHandler) error {
+	if s.closed.Load() {
+		return errors.New("subscriber: closed")
+	}
+	zap.S().Debugf("普通订阅开始: %s", subj)
+	sub, err := s.Conn.Subscribe(subj, s.wrapgo(subj, h))
+	if err != nil {
+		return err
+	}
+	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	return nil
+}
+
+// wrap 为异步回调提供 panic 防护
+func (s *Subscriber) wrapgo(subj string, h nats.MsgHandler) nats.MsgHandler {
+	return func(m *nats.Msg) {
+		go func(msg *nats.Msg) {
+			defer func() {
+				if err := recover(); err != nil {
+					zap.S().Errorf("Err:%v\nSubject:%s\nStack:\n%s",
+						err, subj, debug.Stack())
+				}
+			}()
+			h(msg)
+		}(m)
+	}
+}
+
 // 接受推送过来的消息，如果处理不完直接丢弃
 func (s *Subscriber) SubscribeAndDrop(subj string, h nats.MsgHandler) error {
 	if s.closed.Load() {
@@ -175,7 +218,7 @@ func (s *Subscriber) SubscribeAndDrop(subj string, h nats.MsgHandler) error {
 	return nil
 }
 
-// wrap 为异步回调提供 panic 防护 + 并发限流。
+// 为异步回调提供 panic 防护 + 并发限流。
 func (s *Subscriber) drop(subj string, h nats.MsgHandler) nats.MsgHandler {
 	return func(m *nats.Msg) {
 		// ① 先探测一下令牌可不可拿
