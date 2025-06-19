@@ -1,0 +1,24 @@
+{
+  // 鼠标悬停google翻译
+  "commentTranslate.targetLanguage": "zh-CN",
+  // 点击引入的报名，跳转动作设定
+  // ui.navigation.importShortcut 接受的值:
+  // "Both" (默认,同时跳转定义并打开 godoc 链接)
+  // "Definition" (仅跳转定义处)
+  // "Link" (跳转 godoc 链接)
+  "gopls": {
+    "ui.navigation.importShortcut": "Definition"
+  },
+  "[go]": {
+    "editor.insertSpaces": false,
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    }
+  },
+  "go.lintTool": "golangci-lint",
+  "go.lintFlags": [
+    "--fast"
+  ],
+  "workbench.tree.indent": 24
+}
