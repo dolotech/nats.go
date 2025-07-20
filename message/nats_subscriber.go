@@ -414,13 +414,31 @@ func (s *streamResponseSender) Send(data []byte) error {
 		return errors.New("sender已关闭")
 	}
 
+	// 检查上下文是否已取消
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	default:
+		// 检查连接状态
+		if s.conn.IsClosed() {
+			return errors.New("NATS连接已关闭")
+		}
+
+		// 检查连接健康状态
+		if !s.conn.IsConnected() {
+			return errors.New("NATS连接不可用")
+		}
+
+		// 发送数据
 		if err := s.conn.Publish(s.inbox, data); err != nil {
 			zap.S().Errorf("发送流式响应失败: %v", err)
 			return err
+		}
+
+		// 强制刷新确保消息发送
+		if err := s.conn.Flush(); err != nil {
+			zap.S().Errorf("刷新NATS连接失败: %v", err)
+			return fmt.Errorf("消息发送后刷新失败: %w", err)
 		}
 
 		atomic.AddInt64(&s.sendCount, 1)
@@ -434,10 +452,29 @@ func (s *streamResponseSender) SendError(err error) error {
 		return errors.New("sender已关闭")
 	}
 
+	// 检查连接状态
+	if s.conn.IsClosed() {
+		s.close()
+		return errors.New("NATS连接已关闭")
+	}
+
+	if !s.conn.IsConnected() {
+		s.close()
+		return errors.New("NATS连接不可用")
+	}
+
 	errorMsg := []byte("__STREAM_ERROR__:" + err.Error())
 	if publishErr := s.conn.Publish(s.inbox, errorMsg); publishErr != nil {
 		zap.S().Errorf("发送流式错误信号失败: %v", publishErr)
+		s.close()
 		return publishErr
+	}
+
+	// 强制刷新确保错误信号发送
+	if flushErr := s.conn.Flush(); flushErr != nil {
+		zap.S().Errorf("刷新NATS连接失败: %v", flushErr)
+		s.close()
+		return fmt.Errorf("错误信号发送后刷新失败: %w", flushErr)
 	}
 
 	s.close()
@@ -450,11 +487,29 @@ func (s *streamResponseSender) End() error {
 		return nil // 已经关闭，忽略
 	}
 
+	// 检查连接状态
+	if s.conn.IsClosed() {
+		s.close()
+		return errors.New("NATS连接已关闭")
+	}
+
+	if !s.conn.IsConnected() {
+		s.close()
+		return errors.New("NATS连接不可用")
+	}
+
 	endMsg := []byte("__STREAM_END__")
 	if err := s.conn.Publish(s.inbox, endMsg); err != nil {
 		zap.S().Errorf("发送流式结束信号失败: %v", err)
 		s.close()
 		return err
+	}
+
+	// 强制刷新确保结束信号发送
+	if flushErr := s.conn.Flush(); flushErr != nil {
+		zap.S().Errorf("刷新NATS连接失败: %v", flushErr)
+		s.close()
+		return fmt.Errorf("结束信号发送后刷新失败: %w", flushErr)
 	}
 
 	s.close()
