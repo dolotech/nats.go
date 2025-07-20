@@ -562,6 +562,38 @@ func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string,
 	return ctx.Err()
 }
 
+// StreamQueueSubscribeHandler 流式队列订阅处理器 - 使用回调模式
+// 基于请求-响应模型，只有当收到流式请求时才会发送对应的流式消息
+// 使用队列组实现负载均衡，多个实例可以共享工作负载
+func (s *Subscriber) StreamQueueSubscribeHandler(ctx context.Context, subject, queue string, handler CallbackStreamHandler) error {
+	if s.closed.Load() {
+		return errors.New("subscriber: closed")
+	}
+
+	zap.S().Infof("启动流式队列订阅处理器（回调模式）: %s [queue: %s]", subject, queue)
+
+	// 订阅流式请求
+	sub, err := s.Conn.QueueSubscribe(subject, queue, func(m *nats.Msg) {
+		// 为每个请求启动独立的流式响应协程
+		go s.handleCallbackStreamRequest(ctx, m, handler)
+	})
+
+	if err != nil {
+		return fmt.Errorf("订阅流式请求失败: %v", err)
+	}
+
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
+
+	// 等待上下文取消
+	<-ctx.Done()
+
+	// 清理订阅
+	sub.Unsubscribe()
+	zap.S().Infof("流式队列订阅处理器已停止: %s [queue: %s]", subject, queue)
+
+	return ctx.Err()
+}
+
 // StreamSubscriptionHandle 流式订阅控制句柄
 type StreamSubscriptionHandle struct {
 	subscription *nats.Subscription
