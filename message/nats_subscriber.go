@@ -327,23 +327,117 @@ func (s *Subscriber) msgLoop(sub *nats.Subscription, h nats.MsgHandler) {
 	}
 }
 
-// StreamResponseHandler 流式响应处理器函数类型
-// 返回值: (数据, 是否继续发送, 错误)
-type StreamResponseHandler func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error)
+// ResponseSender 响应发送器接口
+type ResponseSender interface {
+	Send(data []byte) error    // 发送数据
+	SendError(err error) error // 发送错误
+	End() error                // 结束流式响应
+	IsClosed() bool            // 检查是否已关闭
+}
 
-// StreamSubscribeHandler 流式订阅处理器 - 接收请求后持续发送流式响应数据
+// CallbackStreamHandler 回调式流式处理器
+type CallbackStreamHandler func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error
+
+// streamResponseSender ResponseSender 的实现
+type streamResponseSender struct {
+	conn      *nats.Conn
+	inbox     string
+	ctx       context.Context
+	closed    atomic.Bool
+	mu        sync.RWMutex
+	sendCount int64
+}
+
+// newStreamResponseSender 创建新的响应发送器
+func newStreamResponseSender(conn *nats.Conn, inbox string, ctx context.Context) *streamResponseSender {
+	return &streamResponseSender{
+		conn:  conn,
+		inbox: inbox,
+		ctx:   ctx,
+	}
+}
+
+// Send 发送数据
+func (s *streamResponseSender) Send(data []byte) error {
+	if s.IsClosed() {
+		return errors.New("sender已关闭")
+	}
+
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	default:
+		if err := s.conn.Publish(s.inbox, data); err != nil {
+			zap.S().Errorf("发送流式响应失败: %v", err)
+			return err
+		}
+
+		atomic.AddInt64(&s.sendCount, 1)
+		return nil
+	}
+}
+
+// SendError 发送错误信号
+func (s *streamResponseSender) SendError(err error) error {
+	if s.IsClosed() {
+		return errors.New("sender已关闭")
+	}
+
+	errorMsg := []byte("__STREAM_ERROR__:" + err.Error())
+	if publishErr := s.conn.Publish(s.inbox, errorMsg); publishErr != nil {
+		zap.S().Errorf("发送流式错误信号失败: %v", publishErr)
+		return publishErr
+	}
+
+	s.close()
+	return nil
+}
+
+// End 结束流式响应
+func (s *streamResponseSender) End() error {
+	if s.IsClosed() {
+		return nil // 已经关闭，忽略
+	}
+
+	endMsg := []byte("__STREAM_END__")
+	if err := s.conn.Publish(s.inbox, endMsg); err != nil {
+		zap.S().Errorf("发送流式结束信号失败: %v", err)
+		s.close()
+		return err
+	}
+
+	s.close()
+	return nil
+}
+
+// IsClosed 检查是否已关闭
+func (s *streamResponseSender) IsClosed() bool {
+	return s.closed.Load()
+}
+
+// close 内部关闭方法
+func (s *streamResponseSender) close() {
+	s.closed.Store(true)
+}
+
+// GetSendCount 获取发送次数（用于监控）
+func (s *streamResponseSender) GetSendCount() int64 {
+	return atomic.LoadInt64(&s.sendCount)
+}
+
+// StreamSubscribeHandler 流式订阅处理器 - 使用回调模式
 // 基于请求-响应模型，只有当收到流式请求时才会发送对应的流式消息
-func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string, responseHandler StreamResponseHandler) error {
+func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string, handler CallbackStreamHandler) error {
 	if s.closed.Load() {
 		return errors.New("subscriber: closed")
 	}
 
-	zap.S().Infof("启动流式订阅处理器: %s", subject)
+	zap.S().Infof("启动流式订阅处理器（回调模式）: %s", subject)
 
 	// 订阅流式请求
 	sub, err := s.Conn.Subscribe(subject, func(m *nats.Msg) {
 		// 为每个请求启动独立的流式响应协程
-		go s.handleStreamRequest(ctx, m, responseHandler)
+		go s.handleCallbackStreamRequest(ctx, m, handler)
 	})
 
 	if err != nil {
@@ -362,92 +456,58 @@ func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string,
 	return ctx.Err()
 }
 
-// handleStreamRequest 处理单个流式请求
-func (s *Subscriber) handleStreamRequest(ctx context.Context, requestMsg *nats.Msg, responseHandler StreamResponseHandler) {
+// handleCallbackStreamRequest 处理单个回调式流式请求
+func (s *Subscriber) handleCallbackStreamRequest(ctx context.Context, requestMsg *nats.Msg, handler CallbackStreamHandler) {
 	if requestMsg.Reply == "" {
 		zap.S().Warnf("流式请求缺少回复地址: subject=%s", requestMsg.Subject)
 		return
 	}
 
 	inbox := requestMsg.Reply
-	responseIndex := 0
 
-	zap.S().Infof("开始处理流式请求: subject=%s, inbox=%s", requestMsg.Subject, inbox)
+	// 创建响应发送器，使用原始上下文避免过早取消
+	sender := newStreamResponseSender(s.Conn, inbox, ctx)
+
+	zap.S().Infof("开始处理回调式流式请求: subject=%s, inbox=%s", requestMsg.Subject, inbox)
 
 	defer func() {
 		if err := recover(); err != nil {
-			zap.S().Errorf("流式请求处理崩溃: %v\n%s", err, debug.Stack())
+			zap.S().Errorf("回调式流式请求处理崩溃: %v\n%s", err, debug.Stack())
+			sender.SendError(fmt.Errorf("服务器内部错误"))
 		}
-		zap.S().Infof("流式请求处理结束: subject=%s, inbox=%s, 发送响应数=%d",
-			requestMsg.Subject, inbox, responseIndex)
+
+		sentCount := sender.GetSendCount()
+		zap.S().Infof("回调式流式请求处理结束: subject=%s, inbox=%s, 发送数=%d",
+			requestMsg.Subject, inbox, sentCount)
 	}()
 
-	// 持续生成并发送流式响应
-	for {
-		select {
-		case <-ctx.Done():
-			// 发送结束信号
-			s.sendEndSignal(inbox)
-			return
-		default:
-			// 生成响应数据
-			responseData, shouldContinue, err := responseHandler(requestMsg, responseIndex)
-			if err != nil {
-				zap.S().Errorf("生成流式响应失败: %v", err)
-				s.sendErrorSignal(inbox, err)
-				return
-			}
-
-			// 发送响应数据
-			if len(responseData) > 0 {
-				if err := s.Conn.Publish(inbox, responseData); err != nil {
-					zap.S().Errorf("发送流式响应失败: %v", err)
-					return
-				}
-				responseIndex++
-			}
-
-			// 检查是否继续发送
-			if !shouldContinue {
-				s.sendEndSignal(inbox)
-				return
-			}
-
-			// 短暂延迟，避免过于频繁的发送
-			time.Sleep(10 * time.Millisecond)
-		}
+	// 调用用户提供的处理器
+	if err := handler(ctx, requestMsg, sender); err != nil {
+		zap.S().Errorf("回调式流式处理器返回错误: %v", err)
+		sender.SendError(err)
+		return
 	}
+
+	// 注意：不要在这里自动调用 sender.End()，因为处理器可能启动了异步协程
+	// 异步协程应该负责调用 sender.End() 或 sender.SendError()
+	// 如果处理器是同步的且没有调用 End()，那是处理器的责任
 }
 
-// sendEndSignal 发送流式结束信号
-func (s *Subscriber) sendEndSignal(inbox string) {
-	endMsg := []byte("__STREAM_END__")
-	if err := s.Conn.Publish(inbox, endMsg); err != nil {
-		zap.S().Errorf("发送流式结束信号失败: %v", err)
-	}
-}
+// BatchCallbackStreamHandler 批量回调式流式处理器
+type BatchCallbackStreamHandler func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error
 
-// sendErrorSignal 发送流式错误信号
-func (s *Subscriber) sendErrorSignal(inbox string, err error) {
-	errorMsg := []byte("__STREAM_ERROR__:" + err.Error())
-	if publishErr := s.Conn.Publish(inbox, errorMsg); publishErr != nil {
-		zap.S().Errorf("发送流式错误信号失败: %v", publishErr)
-	}
-}
-
-// BatchStreamSubscribeHandler 批量流式订阅处理器
-// 支持批量生成和发送流式响应数据，提高吞吐量
-func (s *Subscriber) BatchStreamSubscribeHandler(ctx context.Context, subject string, batchResponseHandler func(requestMsg *nats.Msg, batchIndex int) ([][]byte, bool, error)) error {
+// BatchStreamSubscribeHandler 批量流式订阅处理器 - 使用回调模式
+func (s *Subscriber) BatchStreamSubscribeHandler(ctx context.Context, subject string, handler BatchCallbackStreamHandler) error {
 	if s.closed.Load() {
 		return errors.New("subscriber: closed")
 	}
 
-	zap.S().Infof("启动批量流式订阅处理器: %s", subject)
+	zap.S().Infof("启动批量流式订阅处理器（回调模式）: %s", subject)
 
 	// 订阅流式请求
 	sub, err := s.Conn.Subscribe(subject, func(m *nats.Msg) {
 		// 为每个请求启动独立的批量流式响应协程
-		go s.handleBatchStreamRequest(ctx, m, batchResponseHandler)
+		go s.handleCallbackStreamRequest(ctx, m, CallbackStreamHandler(handler))
 	})
 
 	if err != nil {
@@ -466,63 +526,52 @@ func (s *Subscriber) BatchStreamSubscribeHandler(ctx context.Context, subject st
 	return ctx.Err()
 }
 
-// handleBatchStreamRequest 处理单个批量流式请求
-func (s *Subscriber) handleBatchStreamRequest(ctx context.Context, requestMsg *nats.Msg, batchResponseHandler func(requestMsg *nats.Msg, batchIndex int) ([][]byte, bool, error)) {
-	if requestMsg.Reply == "" {
-		zap.S().Warnf("批量流式请求缺少回复地址: subject=%s", requestMsg.Subject)
-		return
+// StreamResponseHandler 旧版流式响应处理器函数类型（保持兼容性）
+// 返回值: (数据, 是否继续发送, 错误)
+type StreamResponseHandler func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error)
+
+// LegacyStreamSubscribeHandler 兼容旧版的流式订阅处理器
+// 保持向后兼容，但推荐使用新的回调模式
+func (s *Subscriber) LegacyStreamSubscribeHandler(ctx context.Context, subject string, responseHandler StreamResponseHandler) error {
+	if s.closed.Load() {
+		return errors.New("subscriber: closed")
 	}
 
-	inbox := requestMsg.Reply
-	batchIndex := 0
-	totalSent := 0
+	zap.S().Warnf("使用旧版流式订阅处理器: %s (建议升级到回调模式)", subject)
 
-	zap.S().Infof("开始处理批量流式请求: subject=%s, inbox=%s", requestMsg.Subject, inbox)
+	// 将旧版处理器包装为新的回调模式
+	callbackHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
+		responseIndex := 0
 
-	defer func() {
-		if err := recover(); err != nil {
-			zap.S().Errorf("批量流式请求处理崩溃: %v\n%s", err, debug.Stack())
-		}
-		zap.S().Infof("批量流式请求处理结束: subject=%s, inbox=%s, 批次数=%d, 总发送数=%d",
-			requestMsg.Subject, inbox, batchIndex, totalSent)
-	}()
-
-	// 持续生成并发送批量流式响应
-	for {
-		select {
-		case <-ctx.Done():
-			s.sendEndSignal(inbox)
-			return
-		default:
-			// 生成批量响应数据
-			batchData, shouldContinue, err := batchResponseHandler(requestMsg, batchIndex)
-			if err != nil {
-				zap.S().Errorf("生成批量流式响应失败: %v", err)
-				s.sendErrorSignal(inbox, err)
-				return
-			}
-
-			// 发送批量响应数据
-			for _, data := range batchData {
-				if len(data) > 0 {
-					if err := s.Conn.Publish(inbox, data); err != nil {
-						zap.S().Errorf("发送批量流式响应失败: %v", err)
-						return
-					}
-					totalSent++
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				// 调用旧版处理器
+				responseData, shouldContinue, err := responseHandler(requestMsg, responseIndex)
+				if err != nil {
+					return err
 				}
+
+				// 发送响应数据
+				if len(responseData) > 0 {
+					if err := sender.Send(responseData); err != nil {
+						return err
+					}
+					responseIndex++
+				}
+
+				// 检查是否继续发送
+				if !shouldContinue {
+					return nil // 正常结束，End() 会自动调用
+				}
+
+				// 短暂延迟，避免过于频繁的发送
+				time.Sleep(10 * time.Millisecond)
 			}
-
-			batchIndex++
-
-			// 检查是否继续发送
-			if !shouldContinue {
-				s.sendEndSignal(inbox)
-				return
-			}
-
-			// 延迟控制，避免过于频繁的批量发送
-			time.Sleep(50 * time.Millisecond)
 		}
 	}
+
+	return s.StreamSubscribeHandler(ctx, subject, callbackHandler)
 }

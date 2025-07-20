@@ -164,7 +164,7 @@ func TestStreamRequestResponse(t *testing.T) {
 	s := runNATSServer(t)
 	pool := newPool(t, s.ClientURL(), 0)
 
-	t.Run("基本流式请求-响应", func(t *testing.T) {
+	t.Run("基本流式请求-响应（回调模式）", func(t *testing.T) {
 		var receivedCount int32
 
 		// 创建流式响应处理器
@@ -178,14 +178,35 @@ func TestStreamRequestResponse(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// 流式响应处理器 - 模拟生成数据流
-		responseHandler := func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error) {
-			if responseIndex >= 10 { // 发送10条响应后结束
-				return nil, false, nil
-			}
+		// 回调式流式响应处理器 - 模拟生成数据流
+		responseHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
+			// 在异步协程中处理
+			go func() {
+				defer sender.End()
 
-			responseData := fmt.Sprintf("流式响应_%d_请求数据:%s", responseIndex, string(requestMsg.Data))
-			return []byte(responseData), true, nil
+				for i := 0; i < 10; i++ {
+					select {
+					case <-ctx.Done():
+						sender.SendError(ctx.Err())
+						return
+					default:
+						if sender.IsClosed() {
+							return
+						}
+
+						responseData := fmt.Sprintf("流式响应_%d_请求数据:%s", i, string(requestMsg.Data))
+						if err := sender.Send([]byte(responseData)); err != nil {
+							sender.SendError(err)
+							return
+						}
+
+						// 短暂延迟模拟实际处理时间
+						time.Sleep(20 * time.Millisecond)
+					}
+				}
+			}()
+
+			return nil // 立即返回，异步处理
 		}
 
 		// 启动流式订阅处理器
@@ -247,7 +268,7 @@ func TestStreamRequestResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("带超时的流式请求", func(t *testing.T) {
+	t.Run("带超时的流式请求（回调模式）", func(t *testing.T) {
 		var receivedCount int32
 
 		// 创建慢响应处理器
@@ -261,15 +282,33 @@ func TestStreamRequestResponse(t *testing.T) {
 		defer cancel()
 
 		// 慢响应处理器 - 每个响应延迟500ms
-		slowResponseHandler := func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error) {
-			time.Sleep(500 * time.Millisecond) // 模拟慢处理
+		slowResponseHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
+			go func() {
+				defer sender.End()
 
-			if responseIndex >= 20 { // 尝试发送很多响应
-				return nil, false, nil
-			}
+				for i := 0; i < 20; i++ { // 尝试发送20个响应
+					select {
+					case <-ctx.Done():
+						sender.SendError(ctx.Err())
+						return
+					default:
+						if sender.IsClosed() {
+							return
+						}
 
-			responseData := fmt.Sprintf("慢响应_%d", responseIndex)
-			return []byte(responseData), true, nil
+						// 模拟慢处理
+						time.Sleep(500 * time.Millisecond)
+
+						responseData := fmt.Sprintf("慢响应_%d", i)
+						if err := sender.Send([]byte(responseData)); err != nil {
+							sender.SendError(err)
+							return
+						}
+					}
+				}
+			}()
+
+			return nil
 		}
 
 		// 启动慢响应处理器
@@ -317,7 +356,7 @@ func TestStreamRequestResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("批量流式请求-响应", func(t *testing.T) {
+	t.Run("批量流式请求-响应（回调模式）", func(t *testing.T) {
 		var receivedCount int32
 		var batchCount int32
 
@@ -331,18 +370,36 @@ func TestStreamRequestResponse(t *testing.T) {
 		defer cancel()
 
 		// 批量响应处理器 - 每批生成5条数据
-		batchResponseHandler := func(requestMsg *nats.Msg, batchIndex int) ([][]byte, bool, error) {
-			if batchIndex >= 3 { // 发送3批数据
-				return nil, false, nil
-			}
+		batchResponseHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
+			go func() {
+				defer sender.End()
 
-			var batchData [][]byte
-			for i := 0; i < 5; i++ {
-				data := fmt.Sprintf("批量响应_批次%d_项目%d", batchIndex, i)
-				batchData = append(batchData, []byte(data))
-			}
+				for batchIndex := 0; batchIndex < 3; batchIndex++ { // 发送3批数据
+					select {
+					case <-ctx.Done():
+						sender.SendError(ctx.Err())
+						return
+					default:
+						if sender.IsClosed() {
+							return
+						}
 
-			return batchData, true, nil
+						// 生成一批数据
+						for i := 0; i < 5; i++ {
+							data := fmt.Sprintf("批量响应_批次%d_项目%d", batchIndex, i)
+							if err := sender.Send([]byte(data)); err != nil {
+								sender.SendError(err)
+								return
+							}
+						}
+
+						// 批次间短暂延迟
+						time.Sleep(50 * time.Millisecond)
+					}
+				}
+			}()
+
+			return nil
 		}
 
 		// 启动批量响应处理器
@@ -402,6 +459,119 @@ func TestStreamRequestResponse(t *testing.T) {
 			t.Errorf("期望收到3个批次，实际收到%d个", batches)
 		}
 	})
+
+	t.Run("第三方API模拟测试", func(t *testing.T) {
+		var receivedCount int32
+
+		subscriber, err := NewSubscriber([]string{s.ClientURL()})
+		if err != nil {
+			t.Fatalf("创建订阅者失败: %v", err)
+		}
+		defer subscriber.Close(context.Background())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// 模拟调用第三方API的处理器
+		thirdPartyAPIHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
+			// 异步调用第三方API
+			go func() {
+				defer sender.End()
+
+				// 模拟第三方API调用延迟
+				select {
+				case <-ctx.Done():
+					sender.SendError(ctx.Err())
+					return
+				case <-time.After(100 * time.Millisecond):
+					// 继续处理
+				}
+
+				// 模拟从第三方API获取到的数据流
+				for i := 0; i < 5; i++ {
+					select {
+					case <-ctx.Done():
+						sender.SendError(ctx.Err())
+						return
+					default:
+						if sender.IsClosed() {
+							return
+						}
+
+						// 模拟第三方API返回的数据
+						apiData := fmt.Sprintf(`{
+							"api_response": %d,
+							"request_id": "%s",
+							"timestamp": %d,
+							"status": "success"
+						}`, i, string(requestMsg.Data), time.Now().Unix())
+
+						if err := sender.Send([]byte(apiData)); err != nil {
+							sender.SendError(err)
+							return
+						}
+
+						// 模拟API调用间隔
+						time.Sleep(150 * time.Millisecond)
+					}
+				}
+			}()
+
+			return nil // 立即返回，不阻塞
+		}
+
+		// 启动第三方API处理器
+		go func() {
+			err := subscriber.StreamSubscribeHandler(ctx, "thirdparty.api", thirdPartyAPIHandler)
+			if err != nil && err != context.Canceled {
+				t.Errorf("第三方API处理器错误: %v", err)
+			}
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+
+		// 发起流式请求
+		requestCtx, requestCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer requestCancel()
+
+		requestData := []byte("api_request_123")
+
+		responseProcessor := func(msg *nats.Msg) bool {
+			data := string(msg.Data)
+
+			if data == "__STREAM_END__" {
+				t.Logf("第三方API流式响应结束")
+				return false
+			}
+
+			if strings.HasPrefix(data, "__STREAM_ERROR__") {
+				t.Errorf("第三方API错误: %s", data)
+				return false
+			}
+
+			atomic.AddInt32(&receivedCount, 1)
+			t.Logf("收到第三方API响应: %s", data)
+
+			// 验证响应包含请求ID
+			if !strings.Contains(data, "api_request_123") {
+				t.Errorf("响应中缺少请求ID: %s", data)
+			}
+
+			return true
+		}
+
+		err = pool.StreamRequest(requestCtx, "thirdparty.api", requestData, responseProcessor)
+		if err != nil {
+			t.Fatalf("第三方API流式请求失败: %v", err)
+		}
+
+		received := atomic.LoadInt32(&receivedCount)
+		t.Logf("总共收到第三方API响应数: %d", received)
+
+		if received != 5 {
+			t.Errorf("期望收到5个第三方API响应，实际收到%d个", received)
+		}
+	})
 }
 
 // TestStreamRequestRetry 测试流式请求重试功能
@@ -423,11 +593,11 @@ func TestStreamRequestRetry(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// 总是失败的响应处理器
-		alwaysFailHandler := func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error) {
+		// 总是失败的响应处理器（回调模式）
+		alwaysFailHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
 			attempt := atomic.AddInt32(&attemptCount, 1)
 			t.Logf("收到请求尝试 #%d", attempt)
-			return nil, false, fmt.Errorf("模拟服务不可用_%d", attempt)
+			return sender.SendError(fmt.Errorf("模拟服务不可用_%d", attempt))
 		}
 
 		go func() {
@@ -484,23 +654,42 @@ func TestStreamRequestRetry(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// 前2次失败，第3次成功的处理器
-		retryThenSuccessHandler := func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error) {
+		// 前2次失败，第3次成功的处理器（回调模式）
+		retryThenSuccessHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
 			attempt := atomic.AddInt32(&attemptCount, 1)
 			t.Logf("收到请求尝试 #%d", attempt)
 
 			if attempt <= 2 {
-				return nil, false, fmt.Errorf("模拟临时失败_%d", attempt)
+				return sender.SendError(fmt.Errorf("模拟临时失败_%d", attempt))
 			}
 
-			// 第3次成功，发送2个响应
-			if responseIndex >= 2 {
-				return nil, false, nil
-			}
+			// 第3次成功，异步发送2个响应
+			go func() {
+				defer sender.End()
 
-			atomic.AddInt32(&successCount, 1)
-			responseData := fmt.Sprintf("成功响应_%d", responseIndex)
-			return []byte(responseData), true, nil
+				for i := 0; i < 2; i++ {
+					select {
+					case <-ctx.Done():
+						sender.SendError(ctx.Err())
+						return
+					default:
+						if sender.IsClosed() {
+							return
+						}
+
+						atomic.AddInt32(&successCount, 1)
+						responseData := fmt.Sprintf("成功响应_%d", i)
+						if err := sender.Send([]byte(responseData)); err != nil {
+							sender.SendError(err)
+							return
+						}
+
+						time.Sleep(10 * time.Millisecond)
+					}
+				}
+			}()
+
+			return nil
 		}
 
 		go func() {
