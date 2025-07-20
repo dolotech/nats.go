@@ -99,6 +99,7 @@ type pooledConn struct {
 type borrowedInfo struct {
 	borrowTime time.Time
 	addr       string
+	bornTime   time.Time // 保存连接的原始创建时间
 }
 
 type Pool struct {
@@ -208,6 +209,7 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			p.borrowedConns[pc.Conn] = &borrowedInfo{
 				borrowTime: time.Now(),
 				addr:       s,
+				bornTime:   pc.born, // 保存原始创建时间
 			}
 			p.muBorrow.Unlock()
 			return pc.Conn, nil
@@ -215,10 +217,12 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 
 		conn, err := p.dial(s)
 		if err == nil {
+			now := time.Now()
 			p.muBorrow.Lock()
 			p.borrowedConns[conn] = &borrowedInfo{
-				borrowTime: time.Now(),
+				borrowTime: now,
 				addr:       s,
+				bornTime:   now, // 新连接的创建时间
 			}
 			p.muBorrow.Unlock()
 			return conn, nil
@@ -252,10 +256,12 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			for _, s := range servers {
 				conn, err := p.dial(s)
 				if err == nil {
+					now := time.Now()
 					p.muBorrow.Lock()
 					p.borrowedConns[conn] = &borrowedInfo{
-						borrowTime: time.Now(),
+						borrowTime: now,
 						addr:       s,
+						bornTime:   now, // 新连接的创建时间
 					}
 					p.muBorrow.Unlock()
 					return conn, nil
@@ -304,10 +310,14 @@ func (p *Pool) Put(c *nats.Conn) {
 	}
 
 	// 保持原始的born时间，修复MaxLife检查
-	bornTime := time.Now()
+	var bornTime time.Time
 	if wasBorrowed && borrowInfo != nil {
-		// 尝试从连接历史中恢复born时间，如果没有则使用当前时间
-		bornTime = borrowInfo.borrowTime
+		// 使用保存的原始创建时间
+		bornTime = borrowInfo.bornTime
+	} else {
+		// 连接没有被正确追踪，使用当前时间（这种情况不应该发生）
+		bornTime = time.Now()
+		zap.S().Warnf("连接归还时缺少借出信息: %s", addr)
 	}
 
 	select {
@@ -672,8 +682,39 @@ func (p *Pool) popIdle(addr string) *pooledConn {
 	if !ok {
 		return nil
 	}
+
+	// 使用非阻塞方式快速获取连接
 	select {
 	case pc := <-ch:
+		// 安全检查：确保连接不为空
+		if pc == nil || pc.Conn == nil {
+			// 尝试再获取一个
+			select {
+			case pc2 := <-ch:
+				if pc2 != nil && pc2.Conn != nil {
+					return pc2
+				}
+				return nil
+			default:
+				return nil
+			}
+		}
+
+		// 快速健康检查
+		if pc.Conn.IsClosed() || !pc.healthy {
+			// 连接不健康，直接丢弃并尝试下一个
+			p.safeCloseConn(pc.Conn)
+			// 尝试再获取一个
+			select {
+			case pc2 := <-ch:
+				if pc2 != nil && pc2.Conn != nil {
+					return pc2
+				}
+				return nil
+			default:
+				return nil
+			}
+		}
 		return pc
 	default:
 		return nil

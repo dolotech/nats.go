@@ -46,6 +46,17 @@ type Subscriber struct {
 	wg     sync.WaitGroup // 同步订阅 msgLoop 追踪
 	tasks  sync.WaitGroup // 异步 handler 追踪
 	pool   chan struct{}  // 信号量池，用作并发控制
+
+	// 新增：统计和监控 - 使用原子计数器
+	messagesReceived  int64
+	messagesProcessed int64
+	messagesFailed    int64
+	messagesDropped   int64
+	goroutineCount    int64
+
+	// 新增：活跃订阅追踪
+	activeSubscriptions sync.Map
+	subscriptionCount   int64
 }
 
 // SubscriberConfig 订阅者配置
@@ -254,24 +265,32 @@ func (s *Subscriber) SubscribeAndDrop(subj string, h nats.MsgHandler) error {
 // 为异步回调提供 panic 防护 + 并发限流。
 func (s *Subscriber) drop(subj string, h nats.MsgHandler) nats.MsgHandler {
 	return func(m *nats.Msg) {
+		atomic.AddInt64(&s.messagesReceived, 1)
+
 		// ① 先探测一下令牌可不可拿
 		select {
 		case s.pool <- struct{}{}:
 			// 立刻拿到令牌，正常流程
 		default:
 			// 探测失败 ⇒ 令牌池满，记录一次告警
+			atomic.AddInt64(&s.messagesDropped, 1)
 			zap.S().Warnf("令牌池满直接丢弃, subject=%s", subj)
 			return
 		}
 
 		s.tasks.Add(1)
+		atomic.AddInt64(&s.goroutineCount, 1)
 		go func() {
 			defer func() {
 				<-s.pool       // 归还令牌
 				s.tasks.Done() // 结束追踪
+				atomic.AddInt64(&s.goroutineCount, -1)
 				if err := recover(); err != nil {
+					atomic.AddInt64(&s.messagesFailed, 1)
 					stack := debug.Stack()
 					zap.S().Errorf("Err:%v\nSubject:%s\nStack:\n%s", err, subj, stack)
+				} else {
+					atomic.AddInt64(&s.messagesProcessed, 1)
 				}
 			}()
 			h(m)
@@ -497,6 +516,10 @@ type StreamSubscriptionHandle struct {
 	queue        string
 	mu           sync.Mutex
 	stopped      bool
+
+	// 新增：资源追踪
+	subscriber     *Subscriber
+	monitorStopped chan struct{}
 }
 
 // Stop 停止流式订阅
@@ -511,11 +534,27 @@ func (h *StreamSubscriptionHandle) Stop() error {
 	h.stopped = true
 	h.cancel() // 取消上下文
 
+	// 等待监控goroutine停止
+	if h.monitorStopped != nil {
+		select {
+		case <-h.monitorStopped:
+			// 监控goroutine已停止
+		case <-time.After(1 * time.Second):
+			zap.S().Warnf("监控goroutine停止超时: %s", h.subject)
+		}
+	}
+
 	if h.subscription != nil {
 		if err := h.subscription.Unsubscribe(); err != nil {
 			zap.S().Errorf("取消订阅失败: %v", err)
 			return err
 		}
+	}
+
+	// 从活跃订阅中移除
+	if h.subscriber != nil {
+		h.subscriber.activeSubscriptions.Delete(h.subject)
+		atomic.AddInt64(&h.subscriber.subscriptionCount, -1)
 	}
 
 	if h.queue != "" {
@@ -550,10 +589,12 @@ func (s *Subscriber) StreamQueueSubscribeHandlerAsync(parentCtx context.Context,
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	handle := &StreamSubscriptionHandle{
-		ctx:     ctx,
-		cancel:  cancel,
-		subject: subject,
-		queue:   queue,
+		ctx:            ctx,
+		cancel:         cancel,
+		subject:        subject,
+		queue:          queue,
+		subscriber:     s,
+		monitorStopped: make(chan struct{}),
 	}
 
 	zap.S().Infof("启动异步流式队列订阅处理器: %s [queue: %s]", subject, queue)
@@ -572,14 +613,20 @@ func (s *Subscriber) StreamQueueSubscribeHandlerAsync(parentCtx context.Context,
 
 	if err != nil {
 		cancel()
+		close(handle.monitorStopped)
 		return nil, fmt.Errorf("订阅流式请求失败: %v", err)
 	}
 
 	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	handle.subscription = sub
 
-	// 启动后台监控goroutine（轻量级）
+	// 记录活跃订阅
+	s.activeSubscriptions.Store(subject, handle)
+	atomic.AddInt64(&s.subscriptionCount, 1)
+
+	// 启动后台监控goroutine（优化：确保正确清理）
 	go func() {
+		defer close(handle.monitorStopped)
 		<-ctx.Done()
 		// 自动清理（如果用户没有手动调用Stop）
 		handle.Stop()
@@ -598,9 +645,11 @@ func (s *Subscriber) StreamSubscribeHandlerAsync(parentCtx context.Context, subj
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	handle := &StreamSubscriptionHandle{
-		ctx:     ctx,
-		cancel:  cancel,
-		subject: subject,
+		ctx:            ctx,
+		cancel:         cancel,
+		subject:        subject,
+		subscriber:     s,
+		monitorStopped: make(chan struct{}),
 	}
 
 	zap.S().Infof("启动异步流式订阅处理器: %s", subject)
@@ -617,14 +666,20 @@ func (s *Subscriber) StreamSubscribeHandlerAsync(parentCtx context.Context, subj
 
 	if err != nil {
 		cancel()
+		close(handle.monitorStopped)
 		return nil, fmt.Errorf("订阅流式请求失败: %v", err)
 	}
 
 	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	handle.subscription = sub
 
+	// 记录活跃订阅
+	s.activeSubscriptions.Store(subject, handle)
+	atomic.AddInt64(&s.subscriptionCount, 1)
+
 	// 启动后台监控
 	go func() {
+		defer close(handle.monitorStopped)
 		<-ctx.Done()
 		handle.Stop()
 	}()
@@ -667,4 +722,15 @@ func (s *Subscriber) handleCallbackStreamRequest(ctx context.Context, requestMsg
 	// 注意：不要在这里自动调用 sender.End()，因为处理器可能启动了异步协程
 	// 异步协程应该负责调用 sender.End() 或 sender.SendError()
 	// 如果处理器是同步的且没有调用 End()，那是处理器的责任
+}
+
+// GetMetrics 获取订阅者指标
+func (s *Subscriber) GetMetrics() SubscriberMetrics {
+	return SubscriberMetrics{
+		TotalMessagesReceived: atomic.LoadInt64(&s.messagesReceived),
+		MessagesProcessed:     atomic.LoadInt64(&s.messagesProcessed),
+		MessagesFailed:        atomic.LoadInt64(&s.messagesFailed),
+		MessagesDropped:       atomic.LoadInt64(&s.messagesDropped),
+		ActiveSubscriptions:   atomic.LoadInt64(&s.subscriptionCount),
+	}
 }
