@@ -76,7 +76,7 @@ func StreamRequestExample() {
 		}
 
 		// 检查错误信号
-		if data[:15] == "__STREAM_ERROR__" {
+		if len(data) > 15 && data[:15] == "__STREAM_ERROR__" {
 			fmt.Printf("股票价格流错误: %s\n", data[16:])
 			return false
 		}
@@ -91,56 +91,6 @@ func StreamRequestExample() {
 	if err != nil {
 		fmt.Printf("流式请求结束: %v\n", err)
 	}
-}
-
-// StreamSubscribeWithWriterExample 演示流式订阅写入文件功能
-func StreamSubscribeWithWriterExample() {
-	// 创建订阅者
-	subscriber, err := NewSubscriber([]string{"nats://localhost:4222"})
-	if err != nil {
-		log.Fatalf("创建订阅者失败: %v", err)
-	}
-	defer subscriber.Close(context.Background())
-
-	// 创建按小时分割的文件写入器
-	writer := NewHourlyFileWriter("/var/log/nats", "trading_events")
-
-	// 消息格式化器 - 将交易事件格式化为日志
-	formatter := func(msg *nats.Msg) []byte {
-		timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-		line := fmt.Sprintf("[%s] 主题: %s, 数据: %s\n", timestamp, msg.Subject, string(msg.Data))
-		return []byte(line)
-	}
-
-	// 启动流式订阅写入
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	fmt.Println("开始监听交易事件并写入文件...")
-	err = subscriber.StreamSubscribeWithWriter(ctx, "trading.events.*", writer, formatter)
-	if err != nil {
-		log.Fatalf("启动流式订阅写入失败: %v", err)
-	}
-
-	// 模拟发送交易事件
-	nc, _ := nats.Connect("nats://localhost:4222")
-	defer nc.Close()
-
-	for i := 0; i < 20; i++ {
-		// 模拟不同类型的交易事件
-		events := []string{"buy", "sell", "cancel"}
-		eventType := events[i%3]
-
-		eventData := fmt.Sprintf(`{"type":"%s","symbol":"TSLA","quantity":%d,"price":%.2f}`,
-			eventType, (i+1)*100, 250.0+float64(i)*0.1)
-
-		nc.Publish(fmt.Sprintf("trading.events.%s", eventType), []byte(eventData))
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	// 等待写入完成
-	time.Sleep(2 * time.Second)
-	fmt.Println("交易事件写入演示完成")
 }
 
 // BatchStreamExample 演示批量流式请求功能
@@ -210,7 +160,7 @@ func BatchStreamExample() {
 			return false
 		}
 
-		if data[:15] == "__STREAM_ERROR__" {
+		if len(data) > 15 && data[:15] == "__STREAM_ERROR__" {
 			fmt.Printf("批量分析错误: %s\n", data[16:])
 			return false
 		}
@@ -218,7 +168,7 @@ func BatchStreamExample() {
 		totalItems++
 
 		// 检测新批次
-		if data[:8] == `{"batch":` && data[17:24] == `,"item":0` {
+		if len(data) > 24 && data[:8] == `{"batch":` && data[17:24] == `,"item":0` {
 			batchCount++
 			fmt.Printf("开始处理第 %d 批次\n", batchCount)
 		}
@@ -292,7 +242,7 @@ func RetryStreamExample() {
 	responseProcessor := func(msg *nats.Msg) bool {
 		data := string(msg.Data)
 
-		if data[:15] == "__STREAM_ERROR__" {
+		if len(data) > 15 && data[:15] == "__STREAM_ERROR__" {
 			fmt.Printf("收到服务错误: %s\n", data[16:])
 			return false
 		}
@@ -319,9 +269,9 @@ func RetryStreamExample() {
 	}
 }
 
-// RealTimeLogAnalysisExample 演示实时日志分析场景
-func RealTimeLogAnalysisExample() {
-	fmt.Println("=== 实时日志分析演示 ===")
+// RealTimeDataStreamExample 演示实时数据流场景
+func RealTimeDataStreamExample() {
+	fmt.Println("=== 实时数据流演示 ===")
 
 	// 创建连接池
 	cfg := Config{
@@ -334,7 +284,7 @@ func RealTimeLogAnalysisExample() {
 	}
 	defer pool.Close()
 
-	// 创建日志分析订阅者
+	// 创建数据流订阅者
 	subscriber, err := NewSubscriber([]string{"nats://localhost:4222"})
 	if err != nil {
 		log.Fatalf("创建订阅者失败: %v", err)
@@ -344,129 +294,102 @@ func RealTimeLogAnalysisExample() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 日志分析响应处理器
-	logAnalysisHandler := func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error) {
-		if responseIndex >= 8 { // 分析8条日志
+	// 实时数据流处理器
+	dataStreamHandler := func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error) {
+		if responseIndex >= 8 { // 发送8条数据
 			return nil, false, nil
 		}
 
-		// 模拟日志分析结果
-		logLevels := []string{"INFO", "WARN", "ERROR", "DEBUG"}
-		services := []string{"auth-service", "payment-service", "order-service", "user-service"}
+		// 模拟传感器数据
+		sensors := []string{"temperature", "humidity", "pressure", "light"}
+		sensor := sensors[responseIndex%4]
 
-		level := logLevels[responseIndex%4]
-		service := services[responseIndex%4]
+		// 生成模拟数据
+		var value float64
+		switch sensor {
+		case "temperature":
+			value = 20.0 + float64(responseIndex)*0.5
+		case "humidity":
+			value = 50.0 + float64(responseIndex)*1.2
+		case "pressure":
+			value = 1013.0 + float64(responseIndex)*0.3
+		case "light":
+			value = 300.0 + float64(responseIndex)*10.0
+		}
 
-		analysisResult := fmt.Sprintf(`{
+		dataResult := fmt.Sprintf(`{
 			"timestamp":"%s",
-			"level":"%s",
-			"service":"%s",
-			"message":"分析结果_%d",
-			"anomaly_score":%.2f
-		}`, time.Now().Format(time.RFC3339), level, service, responseIndex, float64(responseIndex)*0.1)
+			"sensor":"%s",
+			"value":%.2f,
+			"status":"normal",
+			"sequence":%d
+		}`, time.Now().Format(time.RFC3339), sensor, value, responseIndex)
 
-		return []byte(analysisResult), true, nil
+		return []byte(dataResult), true, nil
 	}
 
-	// 启动日志分析服务
+	// 启动实时数据流服务
 	go func() {
-		err := subscriber.StreamSubscribeHandler(ctx, "logs.analysis.stream", logAnalysisHandler)
+		err := subscriber.StreamSubscribeHandler(ctx, "sensor.data.stream", dataStreamHandler)
 		if err != nil && err != context.Canceled {
-			log.Printf("日志分析服务错误: %v", err)
+			log.Printf("数据流服务错误: %v", err)
 		}
 	}()
 
 	time.Sleep(100 * time.Millisecond)
 
-	// 创建结果写入器
-	writer := NewHourlyFileWriter("/tmp", "log_analysis_results")
-
-	// 启动结果写入服务
-	writeSubscriber, err := NewSubscriber([]string{"nats://localhost:4222"})
-	if err != nil {
-		log.Fatalf("创建写入订阅者失败: %v", err)
-	}
-	defer writeSubscriber.Close(context.Background())
-
-	writeFormatter := func(msg *nats.Msg) []byte {
-		timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-		line := fmt.Sprintf("[%s] 分析结果: %s\n", timestamp, string(msg.Data))
-		return []byte(line)
-	}
-
-	// 启动写入服务（监听收件箱消息）
-	go func() {
-		err := writeSubscriber.StreamSubscribeWithWriter(ctx, "_INBOX.>", writer, writeFormatter)
-		if err != nil {
-			log.Printf("写入服务结束: %v", err)
-		}
-	}()
-
-	// 发起实时日志分析请求
+	// 发起实时数据流请求
 	requestCtx, requestCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer requestCancel()
 
-	requestData := []byte(`{"query":"error_analysis","time_range":"last_1h","services":["all"]}`)
+	requestData := []byte(`{"sensors":["all"],"interval":"1s","format":"json"}`)
 
-	analysisCount := 0
+	dataCount := 0
 	responseProcessor := func(msg *nats.Msg) bool {
 		data := string(msg.Data)
 
 		if data == "__STREAM_END__" {
-			fmt.Printf("日志分析完成，总共分析 %d 条日志\n", analysisCount)
+			fmt.Printf("数据流结束，总共收到 %d 条数据\n", dataCount)
 			return false
 		}
 
-		if data[:15] == "__STREAM_ERROR__" {
-			fmt.Printf("日志分析错误: %s\n", data[16:])
+		if len(data) > 15 && data[:15] == "__STREAM_ERROR__" {
+			fmt.Printf("数据流错误: %s\n", data[16:])
 			return false
 		}
 
-		analysisCount++
-		fmt.Printf("分析进度 [%d/8]: 收到分析结果\n", analysisCount)
-
-		// 简化显示
-		if analysisCount <= 3 {
-			fmt.Printf("详细结果: %s\n", data)
-		}
+		dataCount++
+		fmt.Printf("数据 [%d]: %s\n", dataCount, data)
 
 		return true
 	}
 
-	fmt.Println("开始实时日志分析...")
-	err = pool.StreamRequest(requestCtx, "logs.analysis.stream", requestData, responseProcessor)
+	fmt.Println("开始实时数据流...")
+	err = pool.StreamRequest(requestCtx, "sensor.data.stream", requestData, responseProcessor)
 	if err != nil {
-		fmt.Printf("日志分析请求结束: %v\n", err)
+		fmt.Printf("数据流请求结束: %v\n", err)
 	}
-
-	// 等待写入完成
-	time.Sleep(1 * time.Second)
-	fmt.Println("日志分析结果已保存到文件")
 }
 
 // RunAllStreamExamples 运行所有流式功能示例
 func RunAllStreamExamples() {
-	fmt.Println("=== NATS 流式请求-响应功能演示 ===")
+	fmt.Println("=== NATS 简化流式请求-响应功能演示 ===")
 	fmt.Println()
 
 	fmt.Println("1. 基本流式请求演示（股票价格流）")
 	StreamRequestExample()
 	fmt.Println()
 
-	fmt.Println("2. 流式订阅写入文件演示（交易事件）")
-	StreamSubscribeWithWriterExample()
-	fmt.Println()
-
-	fmt.Println("3. 批量流式请求演示（市场分析）")
+	fmt.Println("2. 批量流式请求演示（市场分析）")
 	BatchStreamExample()
 	fmt.Println()
 
-	fmt.Println("4. 带重试的流式请求演示（不稳定服务）")
+	fmt.Println("3. 带重试的流式请求演示（不稳定服务）")
 	RetryStreamExample()
 	fmt.Println()
 
-	fmt.Println("5. 实时日志分析综合演示")
-	RealTimeLogAnalysisExample()
+	fmt.Println("4. 实时数据流综合演示")
+	RealTimeDataStreamExample()
 	fmt.Println()
 
 	fmt.Println("=== 所有流式功能演示完成 ===")

@@ -3,8 +3,6 @@ package message
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -402,121 +400,6 @@ func TestStreamRequestResponse(t *testing.T) {
 		}
 		if batches != 3 {
 			t.Errorf("期望收到3个批次，实际收到%d个", batches)
-		}
-	})
-
-	t.Run("流式请求写入文件", func(t *testing.T) {
-		// 创建临时目录
-		tmpDir := t.TempDir()
-
-		// 创建按小时分割的文件写入器
-		writer := NewHourlyFileWriter(tmpDir, "stream_test")
-
-		// 创建订阅者用于写入
-		subscriber, err := NewSubscriber([]string{s.ClientURL()})
-		if err != nil {
-			t.Fatalf("创建订阅者失败: %v", err)
-		}
-		defer subscriber.Close(context.Background())
-
-		// 创建应答处理器
-		respSubscriber, err := NewSubscriber([]string{s.ClientURL()})
-		if err != nil {
-			t.Fatalf("创建应答订阅者失败: %v", err)
-		}
-		defer respSubscriber.Close(context.Background())
-
-		// 消息格式化器
-		formatter := func(msg *nats.Msg) []byte {
-			timestamp := time.Now().Format("2006-01-02 15:04:05")
-			line := fmt.Sprintf("[%s] Subject: %s, Data: %s\n", timestamp, msg.Subject, string(msg.Data))
-			return []byte(line)
-		}
-
-		// 启动写入协程
-		writeCtx, writeCancel := context.WithCancel(context.Background())
-		defer writeCancel()
-
-		// 订阅收件箱模式的消息进行写入
-		go func() {
-			err := subscriber.StreamSubscribeWithWriter(writeCtx, "_INBOX.>", writer, formatter)
-			if err != nil {
-				t.Logf("流式写入结束: %v", err)
-			}
-		}()
-
-		// 启动流式响应处理器
-		respCtx, respCancel := context.WithCancel(context.Background())
-		defer respCancel()
-
-		responseHandler := func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error) {
-			if responseIndex >= 5 {
-				return nil, false, nil
-			}
-
-			responseData := fmt.Sprintf("文件写入测试响应_%d", responseIndex)
-			return []byte(responseData), true, nil
-		}
-
-		go func() {
-			err := respSubscriber.StreamSubscribeHandler(respCtx, "file.stream", responseHandler)
-			if err != nil && err != context.Canceled {
-				t.Errorf("文件写入响应处理器错误: %v", err)
-			}
-		}()
-
-		time.Sleep(200 * time.Millisecond)
-
-		// 发起流式请求
-		requestCtx, requestCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer requestCancel()
-
-		requestData := []byte("文件写入测试")
-
-		responseProcessor := func(msg *nats.Msg) bool {
-			data := string(msg.Data)
-			return !strings.HasPrefix(data, "__STREAM_")
-		}
-
-		err = pool.StreamRequest(requestCtx, "file.stream", requestData, responseProcessor)
-		if err != nil {
-			t.Fatalf("文件写入流式请求失败: %v", err)
-		}
-
-		// 等待写入完成
-		time.Sleep(500 * time.Millisecond)
-		writeCancel()
-
-		// 等待写入器关闭
-		time.Sleep(200 * time.Millisecond)
-
-		// 验证文件是否创建并包含数据
-		files, err := filepath.Glob(filepath.Join(tmpDir, "*", "*.log"))
-		if err != nil {
-			t.Fatalf("搜索日志文件失败: %v", err)
-		}
-
-		if len(files) == 0 {
-			t.Fatal("没有创建日志文件")
-		}
-
-		// 读取文件内容验证
-		content, err := os.ReadFile(files[0])
-		if err != nil {
-			t.Fatalf("读取日志文件失败: %v", err)
-		}
-
-		lines := strings.Split(string(content), "\n")
-		messageCount := 0
-		for _, line := range lines {
-			if strings.Contains(line, "_INBOX.") && strings.Contains(line, "文件写入测试响应_") {
-				messageCount++
-			}
-		}
-
-		t.Logf("文件中写入的流式响应数: %d", messageCount)
-		if messageCount == 0 {
-			t.Fatal("没有写入任何流式响应到文件")
 		}
 	})
 }
