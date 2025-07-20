@@ -488,6 +488,150 @@ func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string,
 	return ctx.Err()
 }
 
+// StreamSubscriptionHandle 流式订阅控制句柄
+type StreamSubscriptionHandle struct {
+	subscription *nats.Subscription
+	ctx          context.Context
+	cancel       context.CancelFunc
+	subject      string
+	queue        string
+	mu           sync.Mutex
+	stopped      bool
+}
+
+// Stop 停止流式订阅
+func (h *StreamSubscriptionHandle) Stop() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.stopped {
+		return nil
+	}
+
+	h.stopped = true
+	h.cancel() // 取消上下文
+
+	if h.subscription != nil {
+		if err := h.subscription.Unsubscribe(); err != nil {
+			zap.S().Errorf("取消订阅失败: %v", err)
+			return err
+		}
+	}
+
+	if h.queue != "" {
+		zap.S().Infof("流式队列订阅处理器已停止: %s [queue: %s]", h.subject, h.queue)
+	} else {
+		zap.S().Infof("流式订阅处理器已停止: %s", h.subject)
+	}
+
+	return nil
+}
+
+// IsStopped 检查是否已停止
+func (h *StreamSubscriptionHandle) IsStopped() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stopped
+}
+
+// Context 获取订阅上下文
+func (h *StreamSubscriptionHandle) Context() context.Context {
+	return h.ctx
+}
+
+// StreamQueueSubscribeHandlerAsync 异步流式队列订阅处理器（推荐）
+// 返回控制句柄，调用者可以控制启动/停止，不会阻塞调用线程
+func (s *Subscriber) StreamQueueSubscribeHandlerAsync(parentCtx context.Context, subject, queue string, handler CallbackStreamHandler) (*StreamSubscriptionHandle, error) {
+	if s.closed.Load() {
+		return nil, errors.New("subscriber: closed")
+	}
+
+	// 创建独立的上下文，可以独立控制
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	handle := &StreamSubscriptionHandle{
+		ctx:     ctx,
+		cancel:  cancel,
+		subject: subject,
+		queue:   queue,
+	}
+
+	zap.S().Infof("启动异步流式队列订阅处理器: %s [queue: %s]", subject, queue)
+
+	// 订阅流式请求 - 优化：去掉不必要的goroutine嵌套
+	sub, err := s.Conn.QueueSubscribe(subject, queue, func(m *nats.Msg) {
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			return // 上下文已取消，直接返回
+		default:
+			// 直接在NATS的回调goroutine中处理，避免额外的goroutine创建
+			s.handleCallbackStreamRequest(ctx, m, handler)
+		}
+	})
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("订阅流式请求失败: %v", err)
+	}
+
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
+	handle.subscription = sub
+
+	// 启动后台监控goroutine（轻量级）
+	go func() {
+		<-ctx.Done()
+		// 自动清理（如果用户没有手动调用Stop）
+		handle.Stop()
+	}()
+
+	return handle, nil
+}
+
+// StreamSubscribeHandlerAsync 异步流式订阅处理器（无队列版本）
+func (s *Subscriber) StreamSubscribeHandlerAsync(parentCtx context.Context, subject string, handler CallbackStreamHandler) (*StreamSubscriptionHandle, error) {
+	if s.closed.Load() {
+		return nil, errors.New("subscriber: closed")
+	}
+
+	// 创建独立的上下文
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	handle := &StreamSubscriptionHandle{
+		ctx:     ctx,
+		cancel:  cancel,
+		subject: subject,
+	}
+
+	zap.S().Infof("启动异步流式订阅处理器: %s", subject)
+
+	// 订阅流式请求
+	sub, err := s.Conn.Subscribe(subject, func(m *nats.Msg) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			s.handleCallbackStreamRequest(ctx, m, handler)
+		}
+	})
+
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("订阅流式请求失败: %v", err)
+	}
+
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
+	handle.subscription = sub
+
+	// 启动后台监控
+	go func() {
+		<-ctx.Done()
+		handle.Stop()
+	}()
+
+	return handle, nil
+}
+
 // handleCallbackStreamRequest 处理单个回调式流式请求
 func (s *Subscriber) handleCallbackStreamRequest(ctx context.Context, requestMsg *nats.Msg, handler CallbackStreamHandler) {
 	if requestMsg.Reply == "" {
@@ -523,87 +667,4 @@ func (s *Subscriber) handleCallbackStreamRequest(ctx context.Context, requestMsg
 	// 注意：不要在这里自动调用 sender.End()，因为处理器可能启动了异步协程
 	// 异步协程应该负责调用 sender.End() 或 sender.SendError()
 	// 如果处理器是同步的且没有调用 End()，那是处理器的责任
-}
-
-// BatchCallbackStreamHandler 批量回调式流式处理器
-type BatchCallbackStreamHandler func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error
-
-// BatchStreamSubscribeHandler 批量流式订阅处理器 - 使用回调模式
-func (s *Subscriber) BatchStreamSubscribeHandler(ctx context.Context, subject string, handler BatchCallbackStreamHandler) error {
-	if s.closed.Load() {
-		return errors.New("subscriber: closed")
-	}
-
-	zap.S().Infof("启动批量流式订阅处理器（回调模式）: %s", subject)
-
-	// 订阅流式请求
-	sub, err := s.Conn.Subscribe(subject, func(m *nats.Msg) {
-		// 为每个请求启动独立的批量流式响应协程
-		go s.handleCallbackStreamRequest(ctx, m, CallbackStreamHandler(handler))
-	})
-
-	if err != nil {
-		return fmt.Errorf("订阅批量流式请求失败: %v", err)
-	}
-
-	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
-
-	// 等待上下文取消
-	<-ctx.Done()
-
-	// 清理订阅
-	sub.Unsubscribe()
-	zap.S().Infof("批量流式订阅处理器已停止: %s", subject)
-
-	return ctx.Err()
-}
-
-// StreamResponseHandler 旧版流式响应处理器函数类型（保持兼容性）
-// 返回值: (数据, 是否继续发送, 错误)
-type StreamResponseHandler func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error)
-
-// LegacyStreamSubscribeHandler 兼容旧版的流式订阅处理器
-// 保持向后兼容，但推荐使用新的回调模式
-func (s *Subscriber) LegacyStreamSubscribeHandler(ctx context.Context, subject string, responseHandler StreamResponseHandler) error {
-	if s.closed.Load() {
-		return errors.New("subscriber: closed")
-	}
-
-	zap.S().Warnf("使用旧版流式订阅处理器: %s (建议升级到回调模式)", subject)
-
-	// 将旧版处理器包装为新的回调模式
-	callbackHandler := func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error {
-		responseIndex := 0
-
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				// 调用旧版处理器
-				responseData, shouldContinue, err := responseHandler(requestMsg, responseIndex)
-				if err != nil {
-					return err
-				}
-
-				// 发送响应数据
-				if len(responseData) > 0 {
-					if err := sender.Send(responseData); err != nil {
-						return err
-					}
-					responseIndex++
-				}
-
-				// 检查是否继续发送
-				if !shouldContinue {
-					return nil // 正常结束，End() 会自动调用
-				}
-
-				// 短暂延迟，避免过于频繁的发送
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
-	}
-
-	return s.StreamSubscribeHandler(ctx, subject, callbackHandler)
 }
