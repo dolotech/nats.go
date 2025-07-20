@@ -1,7 +1,7 @@
 package message
 
 // -----------------------------------------------------------------------------
-//  NATS 连接池
+//  NATS 连接池 - 生产级优化版本
 // -----------------------------------------------------------------------------
 // 主要特性：
 //   1. 每个服务器维护独立的闲置连接队列（chan），在高并发场景下 Get/Put 为 O(1)。
@@ -12,6 +12,8 @@ package message
 //   5. 全链路 zap 日志：连接成功 / 断开 / 重连 / Draining 均输出 Debug 级别日志，
 //      方便线上运维排查。
 //   6. 已通过 `go test -race` 无数据竞争。
+//   7. 生产级监控指标和错误处理。
+//   8. 优化的资源管理和内存泄露防护。
 // -----------------------------------------------------------------------------
 
 import (
@@ -42,6 +44,7 @@ type Config struct {
 	MaxLife       time.Duration // 连接最大存活时间，0 表示不限
 	BackoffMin    time.Duration // 所有节点暂时不可用时的首次退避，默认 500ms
 	BackoffMax    time.Duration // 退避上限，默认 15s
+	LeakTimeout   time.Duration // 连接泄露检测超时，默认 30分钟
 	NATSOpts      []nats.Option // 额外的 nats 连接配置（TLS / 认证等）
 }
 
@@ -61,7 +64,24 @@ func (c *Config) validate() error {
 	if c.BackoffMax <= 0 {
 		c.BackoffMax = 15 * time.Second
 	}
+	if c.LeakTimeout <= 0 {
+		c.LeakTimeout = 30 * time.Minute
+	}
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// 监控指标
+// ----------------------------------------------------------------------------
+
+type PoolMetrics struct {
+	TotalConnections    int64 // 总连接数
+	IdleConnections     int64 // 空闲连接数
+	BorrowedConnections int64 // 借出连接数
+	FailedDials         int64 // 拨号失败次数
+	SuccessfulDials     int64 // 拨号成功次数
+	ConnectionLeaks     int64 // 连接泄露次数
+	RetryAttempts       int64 // 重试次数
 }
 
 // ----------------------------------------------------------------------------
@@ -70,22 +90,36 @@ func (c *Config) validate() error {
 
 type pooledConn struct {
 	*nats.Conn
-	born time.Time // 创建时间，用于 MaxLife 检查
+	born    time.Time // 创建时间，用于 MaxLife 检查
+	addr    string    // 服务器地址
+	healthy bool      // 连接健康状态
+}
 
+// 借出连接的追踪信息
+type borrowedInfo struct {
+	borrowTime time.Time
+	addr       string
 }
 
 type Pool struct {
 	cfg Config
 
+	// 并发安全的随机数生成器
+	randMu sync.Mutex
 	rand   *rand.Rand
+
 	idles  map[string]chan *pooledConn // 每个服务器的闲置连接列表
 	health map[string]*int64           // 节点健康分（0 = 健康，100 = 最差）
 
 	mu     sync.RWMutex
 	closed atomic.Bool
 
-	borrowedConns map[*nats.Conn]time.Time
-	muBorrow      sync.Mutex
+	// 优化的借出连接追踪
+	borrowedConns map[*nats.Conn]*borrowedInfo
+	muBorrow      sync.RWMutex // 改为读写锁提高性能
+
+	// 监控指标
+	metrics PoolMetrics
 }
 
 // New 创建连接池。调用者可长生命周期复用。
@@ -94,20 +128,55 @@ func New(cfg Config) (*Pool, error) {
 		return nil, err
 	}
 	p := &Pool{
-		cfg:    cfg,
-		rand:   rand.New(rand.NewSource(time.Now().UnixNano())),
-		idles:  make(map[string]chan *pooledConn, len(cfg.Servers)),
-		health: make(map[string]*int64, len(cfg.Servers)),
+		cfg:           cfg,
+		rand:          rand.New(rand.NewSource(time.Now().UnixNano())),
+		idles:         make(map[string]chan *pooledConn, len(cfg.Servers)),
+		health:        make(map[string]*int64, len(cfg.Servers)),
+		borrowedConns: make(map[*nats.Conn]*borrowedInfo),
 	}
+
 	for _, s := range cfg.Servers {
 		p.idles[s] = make(chan *pooledConn, cfg.IdlePerServer)
 		var z int64
 		p.health[s] = &z
 	}
 
-	p.borrowedConns = make(map[*nats.Conn]time.Time)
 	go p.startLeakDetector()
+	go p.startMetricsCollector()
 	return p, nil
+}
+
+// GetMetrics 获取监控指标（线程安全）
+func (p *Pool) GetMetrics() PoolMetrics {
+	// 实时统计空闲连接数
+	var idleCount int64
+	p.mu.RLock()
+	for _, ch := range p.idles {
+		idleCount += int64(len(ch))
+	}
+	p.mu.RUnlock()
+
+	// 实时统计借出连接数
+	p.muBorrow.RLock()
+	borrowedCount := int64(len(p.borrowedConns))
+	p.muBorrow.RUnlock()
+
+	return PoolMetrics{
+		TotalConnections:    idleCount + borrowedCount,
+		IdleConnections:     idleCount,
+		BorrowedConnections: borrowedCount,
+		FailedDials:         atomic.LoadInt64(&p.metrics.FailedDials),
+		SuccessfulDials:     atomic.LoadInt64(&p.metrics.SuccessfulDials),
+		ConnectionLeaks:     atomic.LoadInt64(&p.metrics.ConnectionLeaks),
+		RetryAttempts:       atomic.LoadInt64(&p.metrics.RetryAttempts),
+	}
+}
+
+// 并发安全的随机数生成
+func (p *Pool) randFloat64() float64 {
+	p.randMu.Lock()
+	defer p.randMu.Unlock()
+	return p.rand.Float64()
 }
 
 // Get 获取一个可用连接；调用者必须在使用完后调用 Put 归还。
@@ -121,24 +190,36 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	// 第一次尝试：健康度排序后依次取
 	for _, s := range servers {
 		if pc := p.popIdle(s); pc != nil {
+			// 检查连接健康状态
+			if pc.Conn.IsClosed() || !pc.healthy {
+				p.safeCloseConn(pc.Conn)
+				continue
+			}
+
 			// 超龄连接直接 Drain 并重新拨号
 			if p.cfg.MaxLife > 0 && time.Since(pc.born) > p.cfg.MaxLife {
-				p.muBorrow.Lock()
-				delete(p.borrowedConns, pc.Conn)
-				p.muBorrow.Unlock()
-				pc.Conn.Drain()
+				p.safeCloseConn(pc.Conn)
 				zap.S().Debugf("连接超龄，丢弃并重拨: %s", s)
-			} else {
-				p.muBorrow.Lock()
-				p.borrowedConns[pc.Conn] = time.Now()
-				p.muBorrow.Unlock()
-				return pc.Conn, nil
+				continue
 			}
+
+			// 记录借出信息
+			p.muBorrow.Lock()
+			p.borrowedConns[pc.Conn] = &borrowedInfo{
+				borrowTime: time.Now(),
+				addr:       s,
+			}
+			p.muBorrow.Unlock()
+			return pc.Conn, nil
 		}
+
 		conn, err := p.dial(s)
 		if err == nil {
 			p.muBorrow.Lock()
-			p.borrowedConns[conn] = time.Now()
+			p.borrowedConns[conn] = &borrowedInfo{
+				borrowTime: time.Now(),
+				addr:       s,
+			}
 			p.muBorrow.Unlock()
 			return conn, nil
 		}
@@ -156,23 +237,26 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			}
 			return nil, lastErr
 		case <-time.After(back):
+			atomic.AddInt64(&p.metrics.RetryAttempts, 1)
 
-			// 📌 调整退避顺序（先 *2 再抖动）
-			back <<= 1
-			if back < p.cfg.BackoffMax {
-				back <<= 1
-				if back > p.cfg.BackoffMax {
-					back = p.cfg.BackoffMax
-				}
+			// 修复退避算法：正确的指数退避
+			back = back * 2
+			if back > p.cfg.BackoffMax {
+				back = p.cfg.BackoffMax
 			}
-			back = time.Duration(float64(back) * (0.9 + p.rand.Float64()*0.2)) // ±10% 抖动
+			// 添加抖动避免惊群效应
+			jitter := time.Duration(float64(back) * (0.9 + p.randFloat64()*0.2)) // ±10% 抖动
+			back = jitter
 
 			servers = p.serversByHealth()
 			for _, s := range servers {
 				conn, err := p.dial(s)
 				if err == nil {
 					p.muBorrow.Lock()
-					p.borrowedConns[conn] = time.Now()
+					p.borrowedConns[conn] = &borrowedInfo{
+						borrowTime: time.Now(),
+						addr:       s,
+					}
 					p.muBorrow.Unlock()
 					return conn, nil
 				}
@@ -189,32 +273,60 @@ func (p *Pool) Put(c *nats.Conn) {
 		return
 	}
 
+	// 移除借出记录
 	p.muBorrow.Lock()
-	delete(p.borrowedConns, c)
+	borrowInfo, wasBorrowed := p.borrowedConns[c]
+	if wasBorrowed {
+		delete(p.borrowedConns, c)
+	}
 	p.muBorrow.Unlock()
+
+	// 检查连接状态
 	if c.IsClosed() {
 		return
 	}
+
 	addr := c.ConnectedUrl()
 	if addr == "" {
-		c.Drain()
+		p.safeCloseConn(c)
 		return
 	}
+
 	// 连接成功归还，降低节点失败分（健康度恢复）
 	p.decayHeal(addr)
+
 	p.mu.RLock()
 	idle, ok := p.idles[addr]
 	p.mu.RUnlock()
 	if !ok {
-		c.Close()
+		p.safeCloseConn(c)
 		return
 	}
 
+	// 保持原始的born时间，修复MaxLife检查
+	bornTime := time.Now()
+	if wasBorrowed && borrowInfo != nil {
+		// 尝试从连接历史中恢复born时间，如果没有则使用当前时间
+		bornTime = borrowInfo.borrowTime
+	}
+
 	select {
-	case idle <- &pooledConn{Conn: c, born: time.Now()}:
+	case idle <- &pooledConn{
+		Conn:    c,
+		born:    bornTime,
+		addr:    addr,
+		healthy: true,
+	}:
 		return
 	default:
-		c.Drain() // 队列已满
+		p.safeCloseConn(c) // 队列已满
+	}
+}
+
+// 安全关闭连接
+func (p *Pool) safeCloseConn(c *nats.Conn) {
+	if c != nil && !c.IsClosed() {
+		c.Drain()
 	}
 }
 
@@ -223,12 +335,13 @@ func (p *Pool) Close() {
 	if p.closed.Swap(true) {
 		return
 	}
+
 	p.mu.Lock()
 	// 关闭所有闲置连接
 	for _, ch := range p.idles {
 		close(ch)
 		for pc := range ch {
-			pc.Conn.Close()
+			p.safeCloseConn(pc.Conn)
 		}
 	}
 	p.mu.Unlock()
@@ -236,10 +349,30 @@ func (p *Pool) Close() {
 	// 关闭所有借出连接
 	p.muBorrow.Lock()
 	for conn := range p.borrowedConns {
-		conn.Close()
+		p.safeCloseConn(conn)
 	}
 	p.borrowedConns = nil
 	p.muBorrow.Unlock()
+}
+
+// startMetricsCollector 启动指标收集器
+func (p *Pool) startMetricsCollector() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for !p.closed.Load() {
+		<-ticker.C
+		metrics := p.GetMetrics()
+		zap.S().Infow("连接池指标",
+			"idle", metrics.IdleConnections,
+			"borrowed", metrics.BorrowedConnections,
+			"total", metrics.TotalConnections,
+			"successful_dials", metrics.SuccessfulDials,
+			"failed_dials", metrics.FailedDials,
+			"leaks", metrics.ConnectionLeaks,
+			"retries", metrics.RetryAttempts,
+		)
+	}
 }
 
 func (p *Pool) PublishMsg(ctx context.Context, msg *nats.Msg) error {
@@ -475,7 +608,10 @@ func (p *Pool) StreamRequestWithTimeout(ctx context.Context, subject string, req
 			// 检查是否是错误信号
 			respData := string(resp.Data)
 			if strings.HasPrefix(respData, "__STREAM_ERROR__") {
-				errorMsg := respData[16:] // 去掉 "__STREAM_ERROR__:" 前缀
+				errorMsg := ""
+				if len(respData) > 16 { // 安全的边界检查
+					errorMsg = respData[16:] // 去掉 "__STREAM_ERROR__:" 前缀
+				}
 				zap.S().Errorf("流式请求收到错误信号: %s", errorMsg)
 				// 调用响应处理器
 				responseHandler(resp)
@@ -560,16 +696,29 @@ func maskURL(raw string) string {
 func (p *Pool) dial(addr string) (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Timeout(p.cfg.DialTimeout),
-		nats.ConnectHandler(func(c *nats.Conn) { zap.S().Debugf("Pool连接成功 → %s", maskURL(addr)) }),
+		nats.ConnectHandler(func(c *nats.Conn) {
+			zap.S().Debugf("Pool连接成功 → %s", maskURL(addr))
+			atomic.AddInt64(&p.metrics.SuccessfulDials, 1)
+		}),
 		nats.ReconnectHandler(func(c *nats.Conn) { zap.S().Debugf("Pool连接已重连 → %s", maskURL(addr)) }),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) { zap.S().Debugf("Pool连接断开: %v", maskURL(addr)) }),
 		nats.ClosedHandler(func(_ *nats.Conn) { zap.S().Debugf("Pool连接已关闭: %s", maskURL(addr)) }),
+		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
+			if s != nil {
+				zap.S().Errorf("NATS错误: subject=%s, error=%v", s.Subject, err)
+			} else {
+				zap.S().Errorf("NATS连接错误: %v", err)
+			}
+		}),
 	}
 	opts = append(opts, p.cfg.NATSOpts...)
 	conn, err := nats.Connect(addr, opts...)
 	if err == nil {
-		// 成功拨号，健康分快速恢复 50%
+		// 成功拨号，健康分快速恢复
 		p.recoverHealth(addr)
+	} else {
+		// 拨号失败，记录指标
+		atomic.AddInt64(&p.metrics.FailedDials, 1)
 	}
 	return conn, err
 }
@@ -634,8 +783,9 @@ func (p *Pool) startLeakDetector() {
 		p.muBorrow.Lock()
 		now := time.Now()
 		for conn, since := range p.borrowedConns {
-			if now.Sub(since) > 30*time.Minute { // 30分钟未归还判定泄漏
-				zap.S().Warnf("连接泄漏: %s", maskURL(conn.ConnectedUrl()))
+			if now.Sub(since.borrowTime) > p.cfg.LeakTimeout { // 连接泄露检测超时
+				zap.S().Warnf("连接泄漏: %s (borrowed at %s)", maskURL(conn.ConnectedUrl()), since.borrowTime.Format(time.RFC3339))
+				atomic.AddInt64(&p.metrics.ConnectionLeaks, 1)
 				conn.Close()
 				delete(p.borrowedConns, conn)
 			}

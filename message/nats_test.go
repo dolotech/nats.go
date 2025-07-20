@@ -105,8 +105,9 @@ func TestConcurrentPublish(t *testing.T) {
 	// 给 NATS flush
 	nc.Flush()
 
-	if ok != n {
-		t.Fatalf("expected %d messages, got %d", n, ok)
+	received := atomic.LoadInt32(&ok)
+	if received != n {
+		t.Fatalf("expected %d messages, got %d", n, received)
 	}
 }
 
@@ -130,8 +131,10 @@ func TestSubscriberQueue(t *testing.T) {
 	nc.Flush()
 
 	time.Sleep(500 * time.Millisecond)
-	if aCnt+bCnt != 100 {
-		t.Fatalf("queue delivery mismatch: %d + %d", aCnt, bCnt)
+	totalReceived := atomic.LoadInt32(&aCnt) + atomic.LoadInt32(&bCnt)
+	if totalReceived != 100000 {
+		t.Fatalf("queue delivery mismatch: %d + %d = %d, expected 100000",
+			atomic.LoadInt32(&aCnt), atomic.LoadInt32(&bCnt), totalReceived)
 	}
 }
 

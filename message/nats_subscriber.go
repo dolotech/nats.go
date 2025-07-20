@@ -25,6 +25,7 @@ import (
 // ----------------------------------------------------------------------------
 
 // 合理默认：64K 条消息或 64 MiB 数据即可触发快速反压。
+// 注意：这些常量已被 SubscriberConfig 替代，保留用于向后兼容
 const (
 	defaultPendingMsgs  = 64 * 1024
 	defaultPendingBytes = 64 * 1024 * 1024
@@ -40,28 +41,59 @@ type Subscriber struct {
 	cancel context.CancelFunc
 	ctx    context.Context
 	Conn   *nats.Conn
+	config SubscriberConfig // 订阅者配置
 	closed atomic.Bool
 	wg     sync.WaitGroup // 同步订阅 msgLoop 追踪
 	tasks  sync.WaitGroup // 异步 handler 追踪
 	pool   chan struct{}  // 信号量池，用作并发控制
 }
 
+// SubscriberConfig 订阅者配置
+type SubscriberConfig struct {
+	MaxWorkers    int           // 最大并发工作者数量，默认为 GOMAXPROCS * 32
+	PendingMsgs   int           // 每个订阅的消息缓冲区大小，默认 64K
+	PendingBytes  int64         // 每个订阅的字节缓冲区大小，默认 64MB
+	ReconnectWait time.Duration // 重连等待时间，默认 2秒
+	MaxReconnects int           // 最大重连次数，-1 表示无限重连
+	PingInterval  time.Duration // Ping间隔，默认 10秒
+	MaxPingsOut   int           // 最大未响应Ping数，默认 3
+}
+
+// DefaultSubscriberConfig 返回默认订阅者配置
+func DefaultSubscriberConfig() SubscriberConfig {
+	return SubscriberConfig{
+		MaxWorkers:    runtime.GOMAXPROCS(0) * 32,
+		PendingMsgs:   64 * 1024,
+		PendingBytes:  64 * 1024 * 1024,
+		ReconnectWait: 2 * time.Second,
+		MaxReconnects: -1,
+		PingInterval:  10 * time.Second,
+		MaxPingsOut:   3,
+	}
+}
+
 // NewSubscriber 新建 Subscriber，并通过信号量池限制异步处理并发度。
 func NewSubscriber(servers []string, opts ...nats.Option) (*Subscriber, error) {
+	return NewSubscriberWithConfig(servers, DefaultSubscriberConfig(), opts...)
+}
+
+// NewSubscriberWithConfig 使用自定义配置创建订阅者
+func NewSubscriberWithConfig(servers []string, config SubscriberConfig, opts ...nats.Option) (*Subscriber, error) {
 	if len(servers) == 0 {
 		return nil, errors.New("subscriber: server 列表为空")
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	// 打乱顺序 → 负载均衡
 	s := make([]string, len(servers))
 	copy(s, servers)
 	rand.Shuffle(len(s), func(i, j int) { s[i], s[j] = s[j], s[i] })
 
-	maxWorkers := runtime.GOMAXPROCS(0) * 32 // 默认并发度，可根据业务规模调整
 	sub := &Subscriber{
 		ctx:    ctx,
 		cancel: cancel,
-		pool:   make(chan struct{}, maxWorkers),
+		pool:   make(chan struct{}, config.MaxWorkers),
+		config: config,
 	}
 
 	// 连接事件日志
@@ -73,7 +105,7 @@ func NewSubscriber(servers []string, opts ...nats.Option) (*Subscriber, error) {
 				droped, _ := s.Dropped()
 				zap.S().Warnf(
 					"[已丢弃的消息数量] subject=%s pending=%d/%d dropped=%d",
-					s.Subject, pending, defaultPendingMsgs, droped)
+					s.Subject, pending, config.PendingMsgs, droped)
 				return
 			}
 			subj := "<nil>"
@@ -82,10 +114,10 @@ func NewSubscriber(servers []string, opts ...nats.Option) (*Subscriber, error) {
 			}
 			zap.S().Errorf("async err on %s: %v", subj, err)
 		}),
-		nats.PingInterval(10*time.Second),
-		nats.MaxPingsOutstanding(3),
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
+		nats.PingInterval(config.PingInterval),
+		nats.MaxPingsOutstanding(config.MaxPingsOut),
+		nats.MaxReconnects(config.MaxReconnects),
+		nats.ReconnectWait(config.ReconnectWait),
 		nats.ClosedHandler(func(_ *nats.Conn) { zap.S().Debug("Subscriber连接已关闭") }),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) { zap.S().Debugf("Subscriber断开: %v", err) }),
 		// 当底层 TCP 断开并重新握手成功时，doReconnect()调用 resendSubscriptions() ,会遍历这个 conn.subs map，针对每个仍然有效的订阅调用 ，发一条新的 SUB/SUB <subject> <sid> <queue> 指令给服务器。
@@ -113,7 +145,7 @@ func (s *Subscriber) QueueSubscribeSync(subj, queue string, h nats.MsgHandler) e
 	if err != nil {
 		return err
 	}
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	s.wg.Add(1)
 	go s.msgLoop(sub, h)
 	return nil
@@ -128,7 +160,7 @@ func (s *Subscriber) SubscribeSync(subj string, h nats.MsgHandler) error {
 	if err != nil {
 		return err
 	}
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	s.wg.Add(1)
 	go s.msgLoop(sub, h)
 	return nil
@@ -144,7 +176,7 @@ func (s *Subscriber) QueueSubscribe(subj, queue string, h nats.MsgHandler) error
 	if err != nil {
 		return err
 	}
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	return nil
 }
 
@@ -158,7 +190,7 @@ func (s *Subscriber) Subscribe(subj string, h nats.MsgHandler) error {
 	if err != nil {
 		return err
 	}
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	return nil
 }
 
@@ -172,7 +204,7 @@ func (s *Subscriber) QueueSubscribeGo(subj, queue string, h nats.MsgHandler) err
 	if err != nil {
 		return err
 	}
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	return nil
 }
 
@@ -186,7 +218,7 @@ func (s *Subscriber) SubscribeGo(subj string, h nats.MsgHandler) error {
 	if err != nil {
 		return err
 	}
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	return nil
 }
 
@@ -215,7 +247,7 @@ func (s *Subscriber) SubscribeAndDrop(subj string, h nats.MsgHandler) error {
 	if err != nil {
 		return err
 	}
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 	return nil
 }
 
@@ -444,7 +476,7 @@ func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string,
 		return fmt.Errorf("订阅流式请求失败: %v", err)
 	}
 
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 
 	// 等待上下文取消
 	<-ctx.Done()
@@ -514,7 +546,7 @@ func (s *Subscriber) BatchStreamSubscribeHandler(ctx context.Context, subject st
 		return fmt.Errorf("订阅批量流式请求失败: %v", err)
 	}
 
-	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 
 	// 等待上下文取消
 	<-ctx.Done()
