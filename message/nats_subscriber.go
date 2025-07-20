@@ -3,7 +3,11 @@ package message
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -323,5 +327,368 @@ func (s *Subscriber) msgLoop(sub *nats.Subscription, h nats.MsgHandler) {
 			}()
 			h(msg)
 		}()
+	}
+}
+
+// StreamWriter 流式写入器接口
+type StreamWriter interface {
+	io.Writer
+	Flush() error
+	Close() error
+}
+
+// HourlyFileWriter 按小时分割的文件写入器
+type HourlyFileWriter struct {
+	baseDir     string
+	filename    string
+	currentFile *os.File
+	currentHour string
+	mu          sync.Mutex
+}
+
+// NewHourlyFileWriter 创建按小时分割的文件写入器
+func NewHourlyFileWriter(baseDir, filename string) *HourlyFileWriter {
+	return &HourlyFileWriter{
+		baseDir:  baseDir,
+		filename: filename,
+	}
+}
+
+// Write 实现 io.Writer 接口
+func (w *HourlyFileWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	currentHour := time.Now().Format("2006010215") // YYYYMMDDHH
+
+	// 检查是否需要切换文件
+	if w.currentHour != currentHour {
+		if w.currentFile != nil {
+			w.currentFile.Close()
+		}
+
+		// 创建新的小时文件
+		hourDir := filepath.Join(w.baseDir, time.Now().Format("20060102"))
+		if err := os.MkdirAll(hourDir, 0755); err != nil {
+			return 0, err
+		}
+
+		filename := fmt.Sprintf("%s_%s.log", w.filename, currentHour)
+		filepath := filepath.Join(hourDir, filename)
+
+		file, err := os.OpenFile(filepath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return 0, err
+		}
+
+		w.currentFile = file
+		w.currentHour = currentHour
+
+		zap.S().Infof("切换到新的小时文件: %s", filepath)
+	}
+
+	if w.currentFile == nil {
+		return 0, errors.New("no current file")
+	}
+
+	return w.currentFile.Write(data)
+}
+
+// Flush 刷新文件缓冲
+func (w *HourlyFileWriter) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.currentFile != nil {
+		return w.currentFile.Sync()
+	}
+	return nil
+}
+
+// Close 关闭文件写入器
+func (w *HourlyFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.currentFile != nil {
+		err := w.currentFile.Close()
+		w.currentFile = nil
+		return err
+	}
+	return nil
+}
+
+// StreamResponseHandler 流式响应处理器函数类型
+// 返回值: (数据, 是否继续发送, 错误)
+type StreamResponseHandler func(requestMsg *nats.Msg, responseIndex int) ([]byte, bool, error)
+
+// StreamSubscribeHandler 流式订阅处理器 - 接收请求后持续发送流式响应数据
+// 基于请求-响应模型，只有当收到流式请求时才会发送对应的流式消息
+func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string, responseHandler StreamResponseHandler) error {
+	if s.closed.Load() {
+		return errors.New("subscriber: closed")
+	}
+
+	zap.S().Infof("启动流式订阅处理器: %s", subject)
+
+	// 订阅流式请求
+	sub, err := s.Conn.Subscribe(subject, func(m *nats.Msg) {
+		// 为每个请求启动独立的流式响应协程
+		go s.handleStreamRequest(ctx, m, responseHandler)
+	})
+
+	if err != nil {
+		return fmt.Errorf("订阅流式请求失败: %v", err)
+	}
+
+	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+
+	// 等待上下文取消
+	<-ctx.Done()
+
+	// 清理订阅
+	sub.Unsubscribe()
+	zap.S().Infof("流式订阅处理器已停止: %s", subject)
+
+	return ctx.Err()
+}
+
+// handleStreamRequest 处理单个流式请求
+func (s *Subscriber) handleStreamRequest(ctx context.Context, requestMsg *nats.Msg, responseHandler StreamResponseHandler) {
+	if requestMsg.Reply == "" {
+		zap.S().Warnf("流式请求缺少回复地址: subject=%s", requestMsg.Subject)
+		return
+	}
+
+	inbox := requestMsg.Reply
+	responseIndex := 0
+
+	zap.S().Infof("开始处理流式请求: subject=%s, inbox=%s", requestMsg.Subject, inbox)
+
+	defer func() {
+		if err := recover(); err != nil {
+			zap.S().Errorf("流式请求处理崩溃: %v\n%s", err, debug.Stack())
+		}
+		zap.S().Infof("流式请求处理结束: subject=%s, inbox=%s, 发送响应数=%d",
+			requestMsg.Subject, inbox, responseIndex)
+	}()
+
+	// 持续生成并发送流式响应
+	for {
+		select {
+		case <-ctx.Done():
+			// 发送结束信号
+			s.sendEndSignal(inbox)
+			return
+		default:
+			// 生成响应数据
+			responseData, shouldContinue, err := responseHandler(requestMsg, responseIndex)
+			if err != nil {
+				zap.S().Errorf("生成流式响应失败: %v", err)
+				s.sendErrorSignal(inbox, err)
+				return
+			}
+
+			// 发送响应数据
+			if len(responseData) > 0 {
+				if err := s.Conn.Publish(inbox, responseData); err != nil {
+					zap.S().Errorf("发送流式响应失败: %v", err)
+					return
+				}
+				responseIndex++
+			}
+
+			// 检查是否继续发送
+			if !shouldContinue {
+				s.sendEndSignal(inbox)
+				return
+			}
+
+			// 短暂延迟，避免过于频繁的发送
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// sendEndSignal 发送流式结束信号
+func (s *Subscriber) sendEndSignal(inbox string) {
+	endMsg := []byte("__STREAM_END__")
+	if err := s.Conn.Publish(inbox, endMsg); err != nil {
+		zap.S().Errorf("发送流式结束信号失败: %v", err)
+	}
+}
+
+// sendErrorSignal 发送流式错误信号
+func (s *Subscriber) sendErrorSignal(inbox string, err error) {
+	errorMsg := []byte("__STREAM_ERROR__:" + err.Error())
+	if publishErr := s.Conn.Publish(inbox, errorMsg); publishErr != nil {
+		zap.S().Errorf("发送流式错误信号失败: %v", publishErr)
+	}
+}
+
+// StreamSubscribeWithWriter 流式订阅持续写入文件
+// 将接收到的流式响应数据持续写入到指定的写入器中
+func (s *Subscriber) StreamSubscribeWithWriter(ctx context.Context, subject string, writer StreamWriter, formatter func(*nats.Msg) []byte) error {
+	if s.closed.Load() {
+		return errors.New("subscriber: closed")
+	}
+
+	// 创建订阅
+	sub, err := s.Conn.SubscribeSync(subject)
+	if err != nil {
+		return err
+	}
+
+	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+
+	// 启动写入协程
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer sub.Unsubscribe() // 在 goroutine 中取消订阅
+		defer writer.Close()
+
+		// 定时刷新写入器
+		flushTicker := time.NewTicker(5 * time.Second)
+		defer flushTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				zap.S().Infof("流式订阅写入停止: %s", subject)
+				return
+			case <-flushTicker.C:
+				if err := writer.Flush(); err != nil {
+					zap.S().Errorf("写入器刷新失败: %v", err)
+				}
+			default:
+				// 拉取消息
+				msg, err := sub.NextMsgWithContext(ctx)
+				if err != nil {
+					switch {
+					case errors.Is(err, context.Canceled):
+						return
+					case errors.Is(err, context.DeadlineExceeded),
+						errors.Is(err, nats.ErrTimeout):
+						continue
+					case errors.Is(err, nats.ErrSlowConsumer):
+						p, _, _ := sub.Pending()
+						zap.S().Warnf("[SlowConsumer] subject=%s pending=%d", subject, p)
+						continue
+					case errors.Is(err, nats.ErrNoServers),
+						errors.Is(err, nats.ErrConnectionClosed):
+						zap.S().Warnf("连接断开，等待重连: %v", err)
+						time.Sleep(time.Second)
+						continue
+					default:
+						zap.S().Errorf("拉取消息失败: %v", err)
+						return
+					}
+				}
+
+				// 格式化并写入数据
+				data := formatter(msg)
+				if len(data) > 0 {
+					if _, err := writer.Write(data); err != nil {
+						zap.S().Errorf("写入数据失败: %v", err)
+						continue
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// BatchStreamSubscribeHandler 批量流式订阅处理器
+// 支持批量生成和发送流式响应数据，提高吞吐量
+func (s *Subscriber) BatchStreamSubscribeHandler(ctx context.Context, subject string, batchResponseHandler func(requestMsg *nats.Msg, batchIndex int) ([][]byte, bool, error)) error {
+	if s.closed.Load() {
+		return errors.New("subscriber: closed")
+	}
+
+	zap.S().Infof("启动批量流式订阅处理器: %s", subject)
+
+	// 订阅流式请求
+	sub, err := s.Conn.Subscribe(subject, func(m *nats.Msg) {
+		// 为每个请求启动独立的批量流式响应协程
+		go s.handleBatchStreamRequest(ctx, m, batchResponseHandler)
+	})
+
+	if err != nil {
+		return fmt.Errorf("订阅批量流式请求失败: %v", err)
+	}
+
+	sub.SetPendingLimits(defaultPendingMsgs, defaultPendingBytes)
+
+	// 等待上下文取消
+	<-ctx.Done()
+
+	// 清理订阅
+	sub.Unsubscribe()
+	zap.S().Infof("批量流式订阅处理器已停止: %s", subject)
+
+	return ctx.Err()
+}
+
+// handleBatchStreamRequest 处理单个批量流式请求
+func (s *Subscriber) handleBatchStreamRequest(ctx context.Context, requestMsg *nats.Msg, batchResponseHandler func(requestMsg *nats.Msg, batchIndex int) ([][]byte, bool, error)) {
+	if requestMsg.Reply == "" {
+		zap.S().Warnf("批量流式请求缺少回复地址: subject=%s", requestMsg.Subject)
+		return
+	}
+
+	inbox := requestMsg.Reply
+	batchIndex := 0
+	totalSent := 0
+
+	zap.S().Infof("开始处理批量流式请求: subject=%s, inbox=%s", requestMsg.Subject, inbox)
+
+	defer func() {
+		if err := recover(); err != nil {
+			zap.S().Errorf("批量流式请求处理崩溃: %v\n%s", err, debug.Stack())
+		}
+		zap.S().Infof("批量流式请求处理结束: subject=%s, inbox=%s, 批次数=%d, 总发送数=%d",
+			requestMsg.Subject, inbox, batchIndex, totalSent)
+	}()
+
+	// 持续生成并发送批量流式响应
+	for {
+		select {
+		case <-ctx.Done():
+			s.sendEndSignal(inbox)
+			return
+		default:
+			// 生成批量响应数据
+			batchData, shouldContinue, err := batchResponseHandler(requestMsg, batchIndex)
+			if err != nil {
+				zap.S().Errorf("生成批量流式响应失败: %v", err)
+				s.sendErrorSignal(inbox, err)
+				return
+			}
+
+			// 发送批量响应数据
+			for _, data := range batchData {
+				if len(data) > 0 {
+					if err := s.Conn.Publish(inbox, data); err != nil {
+						zap.S().Errorf("发送批量流式响应失败: %v", err)
+						return
+					}
+					totalSent++
+				}
+			}
+
+			batchIndex++
+
+			// 检查是否继续发送
+			if !shouldContinue {
+				s.sendEndSignal(inbox)
+				return
+			}
+
+			// 延迟控制，避免过于频繁的批量发送
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 }

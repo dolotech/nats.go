@@ -17,6 +17,7 @@ package message
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
@@ -311,6 +312,217 @@ func (p *Pool) RequestAny(ctx context.Context, subj string, v any) (*nats.Msg, e
 		return nil, err
 	}
 	return nc.RequestWithContext(ctx, subj, b)
+}
+
+// StreamRequest 流式请求功能 - 发起请求后持续接收流式响应数据
+// 基于请求-响应模型，只有发起流式请求时才会收到对应的流式消息
+func (p *Pool) StreamRequest(ctx context.Context, subject string, requestData []byte, responseHandler func(*nats.Msg) bool) error {
+	if p.closed.Load() {
+		return errors.New("natspool: 已关闭")
+	}
+
+	nc, err := p.Get(ctx)
+	if err != nil {
+		return err
+	}
+	defer p.Put(nc)
+
+	// 创建收件箱用于接收流式响应
+	inbox := nats.NewInbox()
+
+	// 订阅收件箱接收流式响应
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		return fmt.Errorf("订阅收件箱失败: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	// 设置订阅限制
+	sub.SetPendingLimits(64*1024, 64*1024*1024)
+
+	// 发送流式请求，指定回复地址为收件箱
+	msg := &nats.Msg{
+		Subject: subject,
+		Reply:   inbox,
+		Data:    requestData,
+	}
+
+	if err := nc.PublishMsg(msg); err != nil {
+		return fmt.Errorf("发送流式请求失败: %v", err)
+	}
+
+	zap.S().Infof("发起流式请求: subject=%s, inbox=%s", subject, inbox)
+
+	// 持续接收流式响应
+	for {
+		select {
+		case <-ctx.Done():
+			zap.S().Infof("流式请求上下文取消: %s", subject)
+			return ctx.Err()
+		default:
+			// 拉取响应消息，设置较短的超时避免阻塞
+			respCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			resp, err := sub.NextMsgWithContext(respCtx)
+			cancel()
+
+			if err != nil {
+				switch {
+				case errors.Is(err, context.Canceled):
+					return ctx.Err()
+				case errors.Is(err, context.DeadlineExceeded), errors.Is(err, nats.ErrTimeout):
+					// 超时继续等待下一条消息
+					continue
+				case errors.Is(err, nats.ErrSlowConsumer):
+					p, _, _ := sub.Pending()
+					zap.S().Warnf("流式请求慢消费: subject=%s pending=%d", subject, p)
+					continue
+				default:
+					zap.S().Errorf("接收流式响应失败: %v", err)
+					return err
+				}
+			}
+
+			// 检查是否是错误信号
+			respData := string(resp.Data)
+			if strings.HasPrefix(respData, "__STREAM_ERROR__") {
+				errorMsg := respData[16:] // 去掉 "__STREAM_ERROR__:" 前缀
+				zap.S().Errorf("流式请求收到错误信号: %s", errorMsg)
+				// 调用响应处理器
+				responseHandler(resp)
+				return fmt.Errorf("流式响应错误: %s", errorMsg)
+			}
+
+			// 处理响应消息，如果返回 false 则结束流式接收
+			shouldContinue := responseHandler(resp)
+			if !shouldContinue {
+				zap.S().Infof("流式请求正常结束: %s", subject)
+				return nil
+			}
+		}
+	}
+}
+
+// StreamRequestWithTimeout 带超时的流式请求
+// requestTimeout: 单个请求的超时时间
+// streamTimeout: 整个流式会话的超时时间
+func (p *Pool) StreamRequestWithTimeout(ctx context.Context, subject string, requestData []byte, requestTimeout, streamTimeout time.Duration, responseHandler func(*nats.Msg) bool) error {
+	if p.closed.Load() {
+		return errors.New("natspool: 已关闭")
+	}
+
+	// 为整个流式会话创建超时上下文
+	streamCtx, streamCancel := context.WithTimeout(ctx, streamTimeout)
+	defer streamCancel()
+
+	nc, err := p.Get(streamCtx)
+	if err != nil {
+		return err
+	}
+	defer p.Put(nc)
+
+	// 创建收件箱
+	inbox := nats.NewInbox()
+
+	// 订阅收件箱
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		return fmt.Errorf("订阅收件箱失败: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	sub.SetPendingLimits(64*1024, 64*1024*1024)
+
+	// 发送流式请求
+	msg := &nats.Msg{
+		Subject: subject,
+		Reply:   inbox,
+		Data:    requestData,
+	}
+
+	if err := nc.PublishMsg(msg); err != nil {
+		return fmt.Errorf("发送流式请求失败: %v", err)
+	}
+
+	zap.S().Infof("发起带超时的流式请求: subject=%s, 请求超时=%v, 流式超时=%v", subject, requestTimeout, streamTimeout)
+
+	// 持续接收流式响应
+	for {
+		select {
+		case <-streamCtx.Done():
+			return streamCtx.Err()
+		default:
+			// 使用请求超时拉取消息
+			respCtx, cancel := context.WithTimeout(streamCtx, requestTimeout)
+			resp, err := sub.NextMsgWithContext(respCtx)
+			cancel()
+
+			if err != nil {
+				switch {
+				case errors.Is(err, context.Canceled):
+					return streamCtx.Err()
+				case errors.Is(err, context.DeadlineExceeded), errors.Is(err, nats.ErrTimeout):
+					continue
+				case errors.Is(err, nats.ErrSlowConsumer):
+					p, _, _ := sub.Pending()
+					zap.S().Warnf("流式请求慢消费: subject=%s pending=%d", subject, p)
+					continue
+				default:
+					zap.S().Errorf("接收流式响应失败: %v", err)
+					return err
+				}
+			}
+
+			// 检查是否是错误信号
+			respData := string(resp.Data)
+			if strings.HasPrefix(respData, "__STREAM_ERROR__") {
+				errorMsg := respData[16:] // 去掉 "__STREAM_ERROR__:" 前缀
+				zap.S().Errorf("流式请求收到错误信号: %s", errorMsg)
+				// 调用响应处理器
+				responseHandler(resp)
+				return fmt.Errorf("流式响应错误: %s", errorMsg)
+			}
+
+			// 处理响应
+			shouldContinue := responseHandler(resp)
+			if !shouldContinue {
+				zap.S().Infof("流式请求正常结束: %s", subject)
+				return nil
+			}
+		}
+	}
+}
+
+// StreamRequestWithRetry 带重试的流式请求
+// 当流式连接中断时自动重试
+func (p *Pool) StreamRequestWithRetry(ctx context.Context, subject string, requestData []byte, maxRetries int, retryDelay time.Duration, responseHandler func(*nats.Msg) bool) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			zap.S().Infof("流式请求重试第 %d 次: %s", attempt, subject)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(retryDelay):
+			}
+		}
+
+		err := p.StreamRequest(ctx, subject, requestData, responseHandler)
+		if err == nil {
+			return nil // 成功完成
+		}
+
+		lastErr = err
+
+		// 检查是否是可重试的错误
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err // 上下文取消不重试
+		}
+
+		zap.S().Warnf("流式请求失败，准备重试: %v", err)
+	}
+
+	return fmt.Errorf("流式请求重试失败，最大重试次数=%d, 最后错误: %v", maxRetries, lastErr)
 }
 
 // ----------------------------------------------------------------------------
