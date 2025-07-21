@@ -671,6 +671,110 @@ func (p *Pool) StreamRequestWithRetry(ctx context.Context, subject string, reque
 	return fmt.Errorf("流式请求重试失败，最大重试次数=%d, 最后错误: %v", maxRetries, lastErr)
 }
 
+// StreamRequestWithClient 带客户端ID的流式请求，简化版本
+// connectID: 客户端连接标识，用于服务端感知客户端离线
+func (p *Pool) StreamRequestWithClient(ctx context.Context, subject string, requestData []byte, connectID string, responseHandler func(*nats.Msg) bool) error {
+	if p.closed.Load() {
+		return errors.New("natspool: 已关闭")
+	}
+
+	nc, err := p.Get(ctx)
+	if err != nil {
+		return err
+	}
+	defer p.Put(nc)
+
+	// 创建收件箱用于接收流式响应
+	inbox := nats.NewInbox()
+
+	// 订阅收件箱接收流式响应
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		return fmt.Errorf("订阅收件箱失败: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	// 设置订阅限制
+	sub.SetPendingLimits(64*1024, 64*1024*1024)
+
+	// 创建带连接ID的流式请求
+	msg := &nats.Msg{
+		Subject: subject,
+		Reply:   inbox,
+		Data:    requestData,
+	}
+
+	// 添加连接ID到消息头（如果提供）
+	if connectID != "" {
+		if msg.Header == nil {
+			msg.Header = make(nats.Header)
+		}
+		msg.Header.Set("Connect-ID", connectID)
+	}
+
+	if err := nc.PublishMsg(msg); err != nil {
+		return fmt.Errorf("发送流式请求失败: %v", err)
+	}
+
+	zap.S().Infof("发起流式请求: subject=%s, inbox=%s, connectID=%s", subject, inbox, connectID)
+
+	// 持续接收流式响应
+	for {
+		select {
+		case <-ctx.Done():
+			// 客户端上下文取消时，标记为离线
+			if connectID != "" {
+				// 这里需要导入message包，但为了避免循环导入，我们在这里直接发布离线事件
+				nc.Publish("client.offline", []byte(connectID))
+			}
+			zap.S().Infof("流式请求上下文取消: %s, connectID=%s", subject, connectID)
+			return ctx.Err()
+		default:
+			// 拉取响应消息，设置较短的超时避免阻塞
+			respCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			resp, err := sub.NextMsgWithContext(respCtx)
+			cancel()
+
+			if err != nil {
+				switch {
+				case errors.Is(err, context.Canceled):
+					return ctx.Err()
+				case errors.Is(err, context.DeadlineExceeded), errors.Is(err, nats.ErrTimeout):
+					// 超时继续等待下一条消息
+					continue
+				case errors.Is(err, nats.ErrSlowConsumer):
+					p, _, _ := sub.Pending()
+					zap.S().Warnf("流式请求慢消费: subject=%s pending=%d connectID=%s", subject, p, connectID)
+					continue
+				default:
+					zap.S().Errorf("接收流式响应失败: %v, connectID=%s", err, connectID)
+					return err
+				}
+			}
+
+			// 检查是否是错误信号
+			respData := string(resp.Data)
+			if strings.HasPrefix(respData, "__STREAM_ERROR__") {
+				errorMsg := ""
+				if len(respData) > 16 {
+					errorMsg = respData[16:] // 去掉 "__STREAM_ERROR__:" 前缀
+				}
+				zap.S().Errorf("流式请求收到错误信号: %s, connectID=%s", errorMsg, connectID)
+				// 调用响应处理器
+				responseHandler(resp)
+				return fmt.Errorf("流式响应错误: %s", errorMsg)
+			}
+
+			// 处理响应消息，如果返回 false 则结束流式接收
+			shouldContinue := responseHandler(resp)
+			if !shouldContinue {
+				zap.S().Infof("流式请求正常结束: %s, connectID=%s", subject, connectID)
+				return nil
+			}
+		}
+	}
+}
+
 // ----------------------------------------------------------------------------
 // 内部辅助函数
 // ----------------------------------------------------------------------------

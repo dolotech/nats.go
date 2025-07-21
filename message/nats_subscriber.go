@@ -389,6 +389,47 @@ type ResponseSender interface {
 // CallbackStreamHandler 回调式流式处理器
 type CallbackStreamHandler func(ctx context.Context, requestMsg *nats.Msg, sender ResponseSender) error
 
+// 简单的客户端连接状态管理
+var (
+	activeConnections = sync.Map{} // map[string]bool - connectID -> 是否活跃
+)
+
+// MarkClientOnline 标记客户端在线
+func MarkClientOnline(connectID string) {
+	if connectID != "" {
+		activeConnections.Store(connectID, true)
+		zap.S().Debugf("客户端上线: %s", connectID)
+	}
+}
+
+// MarkClientOffline 标记客户端离线
+func MarkClientOffline(connectID string) {
+	if connectID != "" {
+		activeConnections.Delete(connectID)
+		zap.S().Infof("客户端离线: %s", connectID)
+	}
+}
+
+// IsClientOnline 检查客户端是否在线
+func IsClientOnline(connectID string) bool {
+	if connectID == "" {
+		return true // 没有connectID时认为是在线的
+	}
+	_, exists := activeConnections.Load(connectID)
+	return exists
+}
+
+// StartClientOfflineListener 启动客户端离线事件监听器
+func (s *Subscriber) StartClientOfflineListener() error {
+	// 监听客户端离线事件
+	return s.Subscribe("client.offline", func(msg *nats.Msg) {
+		connectID := string(msg.Data)
+		if connectID != "" {
+			MarkClientOffline(connectID)
+		}
+	})
+}
+
 // streamResponseSender ResponseSender 的实现
 type streamResponseSender struct {
 	conn      *nats.Conn
@@ -397,14 +438,16 @@ type streamResponseSender struct {
 	closed    atomic.Bool
 	mu        sync.RWMutex
 	sendCount int64
+	connectID string // 客户端连接ID
 }
 
 // newStreamResponseSender 创建新的响应发送器
-func newStreamResponseSender(conn *nats.Conn, inbox string, ctx context.Context) *streamResponseSender {
+func newStreamResponseSender(conn *nats.Conn, inbox string, ctx context.Context, connectID string) *streamResponseSender {
 	return &streamResponseSender{
-		conn:  conn,
-		inbox: inbox,
-		ctx:   ctx,
+		conn:      conn,
+		inbox:     inbox,
+		ctx:       ctx,
+		connectID: connectID,
 	}
 }
 
@@ -412,6 +455,11 @@ func newStreamResponseSender(conn *nats.Conn, inbox string, ctx context.Context)
 func (s *streamResponseSender) Send(data []byte) error {
 	if s.IsClosed() {
 		return errors.New("sender已关闭")
+	}
+
+	// 检查客户端是否在线
+	if !IsClientOnline(s.connectID) {
+		return fmt.Errorf("客户端已离线: %s", s.connectID)
 	}
 
 	// 检查上下文是否已取消
@@ -674,10 +722,18 @@ func (s *Subscriber) handleCallbackStreamRequest(ctx context.Context, requestMsg
 
 	inbox := requestMsg.Reply
 
-	// 创建响应发送器，使用原始上下文避免过早取消
-	sender := newStreamResponseSender(s.Conn, inbox, ctx)
+	// 提取客户端连接ID
+	connectID := requestMsg.Header.Get("Connect-ID")
 
-	zap.S().Infof("开始处理回调式流式请求: subject=%s, inbox=%s", requestMsg.Subject, inbox)
+	// 创建响应发送器，使用原始上下文避免过早取消
+	sender := newStreamResponseSender(s.Conn, inbox, ctx, connectID)
+
+	// 如果有connectID，标记客户端为在线状态
+	if connectID != "" {
+		MarkClientOnline(connectID)
+	}
+
+	zap.S().Infof("开始处理回调式流式请求: subject=%s, inbox=%s, connectID=%s", requestMsg.Subject, inbox, connectID)
 
 	defer func() {
 		if err := recover(); err != nil {

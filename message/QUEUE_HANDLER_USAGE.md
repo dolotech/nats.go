@@ -14,11 +14,10 @@
 
 ## 📊 与其他方法的对比
 
-| 特性 | StreamSubscribeHandler | StreamQueueSubscribeHandler | StreamQueueSubscribeHandlerAsync |
+| 特性 | StreamSubscribeHandler | StreamQueueSubscribeHandler  |
 |------|----------------------|----------------------------|----------------------------------|
 | 队列组支持 | ❌ | ✅ | ✅ |
 | 负载均衡 | ❌ | ✅ | ✅ |
-| 阻塞模式 | ✅ | ✅ | ❌ |
 | 适用场景 | 单实例服务 | 多实例服务 | 高并发微服务 |
 
 ## 💡 基本用法
@@ -288,7 +287,3 @@ func main() {
 - ✅ **API网关**：后端服务负载均衡
 - ✅ **消息队列系统**：消息处理worker集群
 - ✅ **微服务架构**：服务间流式通信
-
----
-
-> 💡 **提示**：如果您需要更细粒度的控制或异步处理，请考虑使用 `StreamQueueSubscribeHandlerAsync` 方法。 

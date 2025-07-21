@@ -89,7 +89,6 @@
 #### 4.3 异步API优化
 - **问题**: 原有流式订阅API会阻塞调用线程
 - **修复**:
-  - 新增 `StreamQueueSubscribeHandlerAsync` 非阻塞API
   - 返回 `StreamSubscriptionHandle` 提供精确控制
   - 去除不必要的goroutine嵌套
 - **影响**: 更好的并发控制和资源利用
@@ -128,9 +127,6 @@
 // ❌ 旧API：阻塞调用线程
 func StreamQueueSubscribeHandler(ctx, subject, queue, handler) error
 
-// ✅ 新API：非阻塞，返回控制句柄
-func StreamQueueSubscribeHandlerAsync(ctx, subject, queue, handler) (*StreamSubscriptionHandle, error)
-```
 
 #### 6.2 配置化订阅者
 ```go
