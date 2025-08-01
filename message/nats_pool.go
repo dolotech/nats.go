@@ -38,14 +38,15 @@ import (
 // ----------------------------------------------------------------------------
 
 type Config struct {
-	Servers       []string      // 服务器地址列表  nats://user:pass@host:4222
-	IdlePerServer int           // 每个节点最大闲置连接数，默认 16
-	DialTimeout   time.Duration // 单次拨号超时，默认 5s
-	MaxLife       time.Duration // 连接最大存活时间，0 表示不限
-	BackoffMin    time.Duration // 所有节点暂时不可用时的首次退避，默认 500ms
-	BackoffMax    time.Duration // 退避上限，默认 15s
-	LeakTimeout   time.Duration // 连接泄露检测超时，默认 30分钟
-	NATSOpts      []nats.Option // 额外的 nats 连接配置（TLS / 认证等）
+	Servers          []string      // 服务器地址列表  nats://user:pass@host:4222
+	IdlePerServer    int           // 每个节点最大闲置连接数，默认 16
+	MinIdlePerServer int           // 每个节点最小保活闲置连接数，默认 4
+	DialTimeout      time.Duration // 单次拨号超时，默认 5s
+	MaxLife          time.Duration // 连接最大存活时间，0 表示不限
+	BackoffMin       time.Duration // 所有节点暂时不可用时的首次退避，默认 500ms
+	BackoffMax       time.Duration // 退避上限，默认 15s
+	LeakTimeout      time.Duration // 连接泄露检测超时，默认 30分钟
+	NATSOpts         []nats.Option // 额外的 nats 连接配置（TLS / 认证等）
 }
 
 func (c *Config) validate() error {
@@ -54,6 +55,15 @@ func (c *Config) validate() error {
 	}
 	if c.IdlePerServer <= 0 {
 		c.IdlePerServer = 16
+	}
+	if c.MinIdlePerServer < 0 {
+		c.MinIdlePerServer = 0
+	}
+	if c.MinIdlePerServer == 0 {
+		c.MinIdlePerServer = 4
+	}
+	if c.MinIdlePerServer > c.IdlePerServer {
+		c.MinIdlePerServer = c.IdlePerServer
 	}
 	if c.DialTimeout <= 0 {
 		c.DialTimeout = 5 * time.Second
@@ -140,6 +150,21 @@ func New(cfg Config) (*Pool, error) {
 		p.idles[s] = make(chan *pooledConn, cfg.IdlePerServer)
 		var z int64
 		p.health[s] = &z
+
+		// 预热最小闲置连接
+		for i := 0; i < cfg.MinIdlePerServer; i++ {
+			conn, err := p.dial(s)
+			if err != nil {
+				zap.S().Warnf("预热连接失败: %v", err)
+				break
+			}
+			p.idles[s] <- &pooledConn{
+				Conn:    conn,
+				born:    time.Now(),
+				addr:    s,
+				healthy: true,
+			}
+		}
 	}
 
 	go p.startLeakDetector()
@@ -292,7 +317,13 @@ func (p *Pool) Put(c *nats.Conn) {
 		return
 	}
 
-	addr := c.ConnectedUrl()
+	var addr string
+	if wasBorrowed && borrowInfo != nil {
+		addr = borrowInfo.addr
+	}
+	if addr == "" {
+		addr = c.ConnectedUrl()
+	}
 	if addr == "" {
 		p.safeCloseConn(c)
 		return
@@ -329,7 +360,20 @@ func (p *Pool) Put(c *nats.Conn) {
 	}:
 		return
 	default:
-		p.safeCloseConn(c) // 队列已满
+		// 队列已满：替换最早闲置连接，保持恒定暖连接
+		select {
+		case old := <-idle:
+			if old != nil {
+				p.safeCloseConn(old.Conn)
+			}
+		default:
+		}
+		idle <- &pooledConn{
+			Conn:    c,
+			born:    bornTime,
+			addr:    addr,
+			healthy: true,
+		}
 	}
 }
 
