@@ -411,20 +411,20 @@ func (p *Pool) Close() {
 
 // startMetricsCollector 启动指标收集器
 func (p *Pool) startMetricsCollector() {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for !p.closed.Load() {
 		<-ticker.C
 		metrics := p.GetMetrics()
-		zap.S().Infow("连接池指标",
-			"idle", metrics.IdleConnections,
-			"borrowed", metrics.BorrowedConnections,
-			"total", metrics.TotalConnections,
-			"successful_dials", metrics.SuccessfulDials,
-			"failed_dials", metrics.FailedDials,
-			"leaks", metrics.ConnectionLeaks,
-			"retries", metrics.RetryAttempts,
+		zap.S().Debugf("连接指标:\n空闲连接数=%d\n, 借出连接数=%d\n, 总连接数=%d\n, 成功拨号数=%d\n, 失败拨号数=%d\n, 连接泄露数=%d\n, 重试次数=%d\n",
+			metrics.IdleConnections,
+			metrics.BorrowedConnections,
+			metrics.TotalConnections,
+			metrics.SuccessfulDials,
+			metrics.FailedDials,
+			metrics.ConnectionLeaks,
+			metrics.RetryAttempts,
 		)
 	}
 }
