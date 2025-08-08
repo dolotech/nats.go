@@ -217,7 +217,7 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	for _, s := range servers {
 		if pc := p.popIdle(s); pc != nil {
 			// 检查连接健康状态
-			if pc.Conn.IsClosed() || !pc.healthy {
+			if pc.Conn.IsClosed() || !pc.healthy || !pc.Conn.IsConnected() {
 				p.safeCloseConn(pc.Conn)
 				continue
 			}
@@ -240,7 +240,14 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			return pc.Conn, nil
 		}
 
-		conn, err := p.dial(s)
+		// 根据上下文动态调整拨号超时，避免单次拨号超时大于整体等待
+		dialTimeout := p.cfg.DialTimeout
+		if deadline, ok := ctx.Deadline(); ok {
+			if remain := time.Until(deadline); remain > 0 && remain < dialTimeout {
+				dialTimeout = remain
+			}
+		}
+		conn, err := p.dialWithTimeout(s, dialTimeout)
 		if err == nil {
 			now := time.Now()
 			p.muBorrow.Lock()
@@ -279,7 +286,14 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 
 			servers = p.serversByHealth()
 			for _, s := range servers {
-				conn, err := p.dial(s)
+				// 动态拨号超时
+				dialTimeout := p.cfg.DialTimeout
+				if deadline, ok := ctx.Deadline(); ok {
+					if remain := time.Until(deadline); remain > 0 && remain < dialTimeout {
+						dialTimeout = remain
+					}
+				}
+				conn, err := p.dialWithTimeout(s, dialTimeout)
 				if err == nil {
 					now := time.Now()
 					p.muBorrow.Lock()
@@ -360,7 +374,7 @@ func (p *Pool) Put(c *nats.Conn) {
 	}:
 		return
 	default:
-		// 队列已满：替换最早闲置连接，保持恒定暖连接
+		// 队列已满：尝试非阻塞替换最早闲置连接，避免阻塞导致死锁
 		select {
 		case old := <-idle:
 			if old != nil {
@@ -368,11 +382,18 @@ func (p *Pool) Put(c *nats.Conn) {
 			}
 		default:
 		}
-		idle <- &pooledConn{
+		// 再次尝试非阻塞放回；若仍然无法放入则直接关闭，避免阻塞
+		select {
+		case idle <- &pooledConn{
 			Conn:    c,
 			born:    bornTime,
 			addr:    addr,
 			healthy: true,
+		}:
+			return
+		default:
+			p.safeCloseConn(c)
+			return
 		}
 	}
 }
@@ -435,7 +456,12 @@ func (p *Pool) PublishMsg(ctx context.Context, msg *nats.Msg) error {
 		return err
 	}
 	defer p.Put(nc)
-	return nc.PublishMsg(msg)
+	if err := nc.PublishMsg(msg); err != nil {
+		return err
+	}
+	// 提升可靠性：确保消息尽快刷出
+	_ = nc.FlushTimeout(2 * time.Second)
+	return nil
 }
 
 // ----------------------------------------------------------------------------
@@ -449,7 +475,12 @@ func (p *Pool) Publish(ctx context.Context, subj string, data []byte) error {
 		return err
 	}
 	defer p.Put(nc)
-	return nc.Publish(subj, data)
+	if err := nc.Publish(subj, data); err != nil {
+		return err
+	}
+	// 提升可靠性：确保消息尽快刷出
+	_ = nc.FlushTimeout(2 * time.Second)
+	return nil
 }
 
 // Request 请求 – 返回 Msg。
@@ -473,7 +504,12 @@ func (p *Pool) PublishAny(ctx context.Context, subj string, v any) error {
 	if err != nil {
 		return err
 	}
-	return nc.Publish(subj, b)
+	if err := nc.Publish(subj, b); err != nil {
+		return err
+	}
+	// 提升可靠性：确保消息尽快刷出
+	_ = nc.FlushTimeout(2 * time.Second)
+	return nil
 }
 
 // Request 请求 – 返回 Msg。
@@ -483,6 +519,8 @@ func (p *Pool) Request(ctx context.Context, subj string, data []byte) (*nats.Msg
 		return nil, err
 	}
 	defer p.Put(nc)
+	// 先确保前序写入刷出，提高请求可用性
+	_ = nc.FlushTimeout(2 * time.Second)
 	return nc.RequestWithContext(ctx, subj, data)
 }
 
@@ -498,6 +536,8 @@ func (p *Pool) RequestAny(ctx context.Context, subj string, v any) (*nats.Msg, e
 	if err != nil {
 		return nil, err
 	}
+	// 先确保前序写入刷出，提高请求可用性
+	_ = nc.FlushTimeout(2 * time.Second)
 	return nc.RequestWithContext(ctx, subj, b)
 }
 
@@ -768,8 +808,16 @@ func (p *Pool) StreamRequestWithClient(ctx context.Context, subject string, requ
 		case <-ctx.Done():
 			// 客户端上下文取消时，标记为离线
 			if connectID != "" {
-				// 这里需要导入message包，但为了避免循环导入，我们在这里直接发布离线事件
-				nc.Publish("client.offline", []byte(connectID))
+				// 发送离线事件并尽量刷出，确保服务端尽快感知
+				_ = nc.Publish("client.offline", []byte(connectID))
+				_ = nc.FlushTimeout(2 * time.Second)
+				// 同进程内回落：直接标记离线，便于单进程测试环境快速收敛
+				MarkClientOffline(connectID)
+				// 等待少许时间，确保监听方消费到离线事件
+				deadline := time.Now().Add(200 * time.Millisecond)
+				for IsClientOnline(connectID) && time.Now().Before(deadline) {
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
 			zap.S().Infof("流式请求上下文取消: %s, connectID=%s", subject, connectID)
 			return ctx.Err()
@@ -782,6 +830,16 @@ func (p *Pool) StreamRequestWithClient(ctx context.Context, subject string, requ
 			if err != nil {
 				switch {
 				case errors.Is(err, context.Canceled):
+					// 进入与 <-ctx.Done() 相同的离线处理流程
+					if connectID != "" {
+						_ = nc.Publish("client.offline", []byte(connectID))
+						_ = nc.FlushTimeout(2 * time.Second)
+						MarkClientOffline(connectID)
+						deadline := time.Now().Add(200 * time.Millisecond)
+						for IsClientOnline(connectID) && time.Now().Before(deadline) {
+							time.Sleep(10 * time.Millisecond)
+						}
+					}
 					return ctx.Err()
 				case errors.Is(err, context.DeadlineExceeded), errors.Is(err, nats.ErrTimeout):
 					// 超时继续等待下一条消息
@@ -901,6 +959,40 @@ func (p *Pool) dial(addr string) (*nats.Conn, error) {
 		}),
 	}
 	opts = append(opts, p.cfg.NATSOpts...)
+	// 允许客户端内建自动重连，提升重启后的恢复概率
+	opts = append(opts, nats.MaxReconnects(-1), nats.ReconnectWait(500*time.Millisecond))
+	conn, err := nats.Connect(addr, opts...)
+	if err == nil {
+		// 成功拨号，健康分快速恢复
+		p.recoverHealth(addr)
+	} else {
+		// 拨号失败，记录指标
+		atomic.AddInt64(&p.metrics.FailedDials, 1)
+	}
+	return conn, err
+}
+
+// dialWithTimeout: 基于临时超时的拨号
+func (p *Pool) dialWithTimeout(addr string, timeout time.Duration) (*nats.Conn, error) {
+	opts := []nats.Option{
+		nats.Timeout(timeout),
+		nats.ConnectHandler(func(c *nats.Conn) {
+			zap.S().Debugf("Pool连接成功 → %s", maskURL(addr))
+			atomic.AddInt64(&p.metrics.SuccessfulDials, 1)
+		}),
+		nats.ReconnectHandler(func(c *nats.Conn) { zap.S().Debugf("Pool连接已重连 → %s", maskURL(addr)) }),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) { zap.S().Debugf("Pool连接断开: %v", maskURL(addr)) }),
+		nats.ClosedHandler(func(_ *nats.Conn) { zap.S().Debugf("Pool连接已关闭: %s", maskURL(addr)) }),
+		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
+			if s != nil {
+				zap.S().Errorf("NATS错误: subject=%s, error=%v", s.Subject, err)
+			} else {
+				zap.S().Errorf("NATS连接错误: %v", err)
+			}
+		}),
+	}
+	opts = append(opts, p.cfg.NATSOpts...)
+	opts = append(opts, nats.MaxReconnects(-1), nats.ReconnectWait(500*time.Millisecond))
 	conn, err := nats.Connect(addr, opts...)
 	if err == nil {
 		// 成功拨号，健康分快速恢复
