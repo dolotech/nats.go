@@ -94,6 +94,30 @@ func NewSubscriberWithConfig(servers []string, config SubscriberConfig, opts ...
 		return nil, errors.New("subscriber: server 列表为空")
 	}
 
+	// 配置健全性检查与默认值兜底，避免零值造成死锁或无限丢弃
+	if config.MaxWorkers <= 0 {
+		config.MaxWorkers = runtime.GOMAXPROCS(0) * 32
+	}
+	if config.PendingMsgs <= 0 {
+		config.PendingMsgs = 64 * 1024
+	}
+	if config.PendingBytes <= 0 {
+		config.PendingBytes = 64 * 1024 * 1024
+	}
+	if config.ReconnectWait <= 0 {
+		config.ReconnectWait = 2 * time.Second
+	}
+	if config.PingInterval <= 0 {
+		config.PingInterval = 10 * time.Second
+	}
+	if config.MaxPingsOut <= 0 {
+		config.MaxPingsOut = 3
+	}
+	// 0 视为未设置，采用无限重连
+	if config.MaxReconnects == 0 {
+		config.MaxReconnects = -1
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	// 打乱顺序 → 负载均衡
 	s := make([]string, len(servers))
@@ -303,19 +327,26 @@ func (s *Subscriber) Close(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+
+	// 先取消上下文，唤醒 msgLoop 以及用户处理协程中的 ctx 检查
+	s.cancel()
+
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
 		s.tasks.Wait() // 等待所有异步处理完成
 		close(done)
 	}()
+
 	select {
 	case <-done:
+		// 所有处理已结束，继续优雅关闭连接
 	case <-ctx.Done():
+		// 超时/取消，强制关闭连接以避免泄露
+		s.Conn.Close()
 		return ctx.Err()
 	}
 
-	s.cancel()
 	return s.Conn.Drain()
 }
 
@@ -600,11 +631,17 @@ func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string,
 
 	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 
+	// 记录活跃订阅
+	s.activeSubscriptions.Store(subject, true)
+	atomic.AddInt64(&s.subscriptionCount, 1)
+
 	// 等待上下文取消
 	<-ctx.Done()
 
 	// 清理订阅
 	sub.Unsubscribe()
+	s.activeSubscriptions.Delete(subject)
+	atomic.AddInt64(&s.subscriptionCount, -1)
 	zap.S().Infof("流式订阅处理器已停止: %s", subject)
 
 	return ctx.Err()
@@ -632,11 +669,17 @@ func (s *Subscriber) StreamQueueSubscribeHandler(ctx context.Context, subject, q
 
 	sub.SetPendingLimits(s.config.PendingMsgs, int(s.config.PendingBytes))
 
+	// 记录活跃订阅
+	s.activeSubscriptions.Store(subject, true)
+	atomic.AddInt64(&s.subscriptionCount, 1)
+
 	// 等待上下文取消
 	<-ctx.Done()
 
 	// 清理订阅
 	sub.Unsubscribe()
+	s.activeSubscriptions.Delete(subject)
+	atomic.AddInt64(&s.subscriptionCount, -1)
 	zap.S().Infof("流式队列订阅处理器已停止: %s [queue: %s]", subject, queue)
 
 	return ctx.Err()
