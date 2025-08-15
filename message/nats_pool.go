@@ -4,7 +4,7 @@ package message
 //  NATS 连接池 - 生产级优化版本
 // -----------------------------------------------------------------------------
 // 主要特性：
-//   1. 每个服务器维护独立的闲置连接队列（chan），在高并发场景下 Get/Put 为 O(1)。
+//   1. 每个服务器维护独立的闲置连接队列（chan），在高并发场景下 Get/Put 为 O(1）。
 //   2. 上层 API 全部使用 context，可精确控制超时与取消。
 //   3. 使用指数退避 + EWMA(指数加权移动平均) 健康分，而不是一次性剔除节点，
 //      使节点恢复更快、误杀更少。
@@ -217,14 +217,22 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	for _, s := range servers {
 		if pc := p.popIdle(s); pc != nil {
 			// 检查连接健康状态
-			if pc.Conn.IsClosed() || !pc.healthy || !pc.Conn.IsConnected() {
+			if pc.Conn.IsClosed() {
 				p.safeCloseConn(pc.Conn)
 				continue
 			}
-
-			// 轻量活性探测：避免服务器已宕而连接暂未标记断开
-			if err := pc.Conn.FlushTimeout(50 * time.Millisecond); err != nil {
-				p.safeCloseConn(pc.Conn)
+			if !pc.healthy || !pc.Conn.IsConnected() {
+				// 不关闭，让其等待 NATS 自动重连；尝试放回原队列
+				p.mu.RLock()
+				idleCh := p.idles[s]
+				p.mu.RUnlock()
+				select {
+				case idleCh <- pc:
+					// 放回等待自愈
+				default:
+					// 放不回则优雅关闭释放资源
+					p.safeCloseConn(pc.Conn)
+				}
 				continue
 			}
 
@@ -284,13 +292,12 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 		case <-time.After(back):
 			atomic.AddInt64(&p.metrics.RetryAttempts, 1)
 
-			// 修复退避算法：正确的指数退避
+			// 指数退避 + 抖动
 			back = back * 2
 			if back > p.cfg.BackoffMax {
 				back = p.cfg.BackoffMax
 			}
-			// 添加抖动避免惊群效应
-			jitter := time.Duration(float64(back) * (0.9 + p.randFloat64()*0.2)) // ±10% 抖动
+			jitter := time.Duration(float64(back) * (0.9 + p.randFloat64()*0.2))
 			back = jitter
 
 			servers = p.serversByHealth()
@@ -309,7 +316,7 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 					p.borrowedConns[conn] = &borrowedInfo{
 						borrowTime: now,
 						addr:       s,
-						bornTime:   now, // 新连接的创建时间
+						bornTime:   now,
 					}
 					p.muBorrow.Unlock()
 					return conn, nil
@@ -366,10 +373,8 @@ func (p *Pool) Put(c *nats.Conn) {
 	// 保持原始的born时间，修复MaxLife检查
 	var bornTime time.Time
 	if wasBorrowed && borrowInfo != nil {
-		// 使用保存的原始创建时间
 		bornTime = borrowInfo.bornTime
 	} else {
-		// 连接没有被正确追踪，使用当前时间（这种情况不应该发生）
 		bornTime = time.Now()
 		zap.S().Warnf("连接归还时缺少借出信息: %s", addr)
 	}
@@ -383,9 +388,27 @@ func (p *Pool) Put(c *nats.Conn) {
 	}:
 		return
 	default:
-		// 队列已满：保留已有闲置，丢弃最新归还的连接，避免池内抖动
-		p.hardCloseConn(c)
-		return
+		// 队列已满：尝试非阻塞替换最早闲置连接，避免阻塞导致死锁
+		select {
+		case old := <-idle:
+			if old != nil {
+				p.safeCloseConn(old.Conn)
+			}
+		default:
+		}
+		// 再次尝试非阻塞放回；若仍然无法放入则直接关闭，避免阻塞
+		select {
+		case idle <- &pooledConn{
+			Conn:    c,
+			born:    bornTime,
+			addr:    addr,
+			healthy: true,
+		}:
+			return
+		default:
+			p.hardCloseConn(c)
+			return
+		}
 	}
 }
 
