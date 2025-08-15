@@ -41,6 +41,7 @@ type Config struct {
 	Servers          []string      // 服务器地址列表  nats://user:pass@host:4222
 	IdlePerServer    int           // 每个节点最大闲置连接数，默认 16
 	MinIdlePerServer int           // 每个节点最小保活闲置连接数，默认 4
+	MaxConnections   int           // 最大总连接数，默认 128，防止资源耗尽
 	DialTimeout      time.Duration // 单次拨号超时，默认 5s
 	MaxLife          time.Duration // 连接最大存活时间，0 表示不限
 	BackoffMin       time.Duration // 所有节点暂时不可用时的首次退避，默认 500ms
@@ -53,6 +54,8 @@ type Config struct {
 	MaxPingsOut   int           // 默认 3
 	MaxReconnects int           // 默认 -1 (无限重连)
 	ReconnectWait time.Duration // 默认 500ms（连接池更积极）
+
+	AcquireTimeout time.Duration // 获取连接超时，默认 10s
 }
 
 func (c *Config) validate() error {
@@ -70,6 +73,9 @@ func (c *Config) validate() error {
 	}
 	if c.MinIdlePerServer > c.IdlePerServer {
 		c.MinIdlePerServer = c.IdlePerServer
+	}
+	if c.MaxConnections <= 0 {
+		c.MaxConnections = 128 // 默认最大100个连接
 	}
 	if c.DialTimeout <= 0 {
 		c.DialTimeout = 5 * time.Second
@@ -95,6 +101,10 @@ func (c *Config) validate() error {
 	}
 	if c.ReconnectWait <= 0 {
 		c.ReconnectWait = 500 * time.Millisecond
+	}
+
+	if c.AcquireTimeout <= 0 {
+		c.AcquireTimeout = 15 * time.Second
 	}
 	return nil
 }
@@ -150,6 +160,9 @@ type Pool struct {
 
 	// 监控指标
 	metrics PoolMetrics
+
+	// 连接数限制信号量
+	connSemaphore chan struct{} // 用于限制最大连接数
 }
 
 // New 创建连接池。调用者可长生命周期复用。
@@ -163,6 +176,7 @@ func New(cfg Config) (*Pool, error) {
 		idles:         make(map[string]chan *pooledConn, len(cfg.Servers)),
 		health:        make(map[string]*int64, len(cfg.Servers)),
 		borrowedConns: make(map[*nats.Conn]*borrowedInfo),
+		connSemaphore: make(chan struct{}, cfg.MaxConnections),
 	}
 
 	for _, s := range cfg.Servers {
@@ -172,9 +186,19 @@ func New(cfg Config) (*Pool, error) {
 
 		// 预热最小闲置连接
 		for i := 0; i < cfg.MinIdlePerServer; i++ {
+			// 为预热连接获取信号量
+			select {
+			case p.connSemaphore <- struct{}{}:
+			default:
+				zap.S().Warnf("预热连接时信号量已满，跳过剩余预热")
+				goto nextServer
+			}
+
 			conn, err := p.dial(s)
 			if err != nil {
 				zap.S().Warnf("预热连接失败: %v", err)
+				// 释放信号量
+				<-p.connSemaphore
 				break
 			}
 			p.idles[s] <- &pooledConn{
@@ -184,6 +208,7 @@ func New(cfg Config) (*Pool, error) {
 				healthy: true,
 			}
 		}
+	nextServer:
 	}
 
 	go p.startLeakDetector()
@@ -229,6 +254,14 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	if p.closed.Load() {
 		return nil, errors.New("natspool: 已关闭")
 	}
+
+	// 仅当调用方未设置超时时，才加默认超时
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.cfg.AcquireTimeout)
+		defer cancel()
+	}
+
 	servers := p.serversByHealth()
 	var lastErr error
 
@@ -261,6 +294,22 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	}
 
 	// 没有可用的空闲连接 → 尝试按健康度拨号（优先最健康）。
+	// 首先获取连接信号量，如果达到上限则阻塞等待
+	select {
+	case p.connSemaphore <- struct{}{}:
+		// 成功获取信号量，可以创建连接
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	// 拨号成功或失败后都要释放信号量
+	defer func() {
+		if lastErr != nil {
+			// 拨号失败，释放信号量
+			<-p.connSemaphore
+		}
+	}()
+
 	// 根据上下文动态调整拨号超时，避免单次拨号超时大于整体等待
 	dialTimeout := p.cfg.DialTimeout
 	if deadline, ok := ctx.Deadline(); ok {
@@ -279,6 +328,8 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 				bornTime:   now, // 新连接的创建时间
 			}
 			p.muBorrow.Unlock()
+			// 成功拨号，确保不释放信号量
+			lastErr = nil
 			return conn, nil
 		}
 		lastErr = err
@@ -328,6 +379,8 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 						bornTime:   now,
 					}
 					p.muBorrow.Unlock()
+					// 成功拨号，确保不释放信号量
+					lastErr = nil
 					return conn, nil
 				}
 				lastErr = err
@@ -359,6 +412,10 @@ func (p *Pool) Put(c *nats.Conn) {
 
 	// 检查连接状态
 	if c.IsClosed() {
+		// 连接已关闭，释放信号量
+		if wasBorrowed {
+			p.releaseConnSemaphore()
+		}
 		return
 	}
 
@@ -413,6 +470,18 @@ func (p *Pool) Put(c *nats.Conn) {
 func (p *Pool) hardCloseConn(c *nats.Conn) {
 	if c != nil && !c.IsClosed() {
 		c.Close()
+	}
+	// 释放连接信号量（无论连接是否已关闭，都释放信号量）
+	p.releaseConnSemaphore()
+}
+
+// 释放连接信号量的辅助方法
+func (p *Pool) releaseConnSemaphore() {
+	select {
+	case <-p.connSemaphore:
+	default:
+		// 信号量已空，可能是重复释放，记录警告
+		zap.S().Warnf("连接信号量释放异常，可能重复释放")
 	}
 }
 
