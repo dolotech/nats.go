@@ -47,6 +47,12 @@ type Config struct {
 	BackoffMax       time.Duration // 退避上限，默认 15s
 	LeakTimeout      time.Duration // 连接泄露检测超时，默认 30分钟
 	NATSOpts         []nats.Option // 额外的 nats 连接配置（TLS / 认证等）
+
+	// 新增：保活与重连参数（与 Subscriber 保持一致的合理默认值）
+	PingInterval  time.Duration // 默认 10s
+	MaxPingsOut   int           // 默认 3
+	MaxReconnects int           // 默认 -1 (无限重连)
+	ReconnectWait time.Duration // 默认 500ms（连接池更积极）
 }
 
 func (c *Config) validate() error {
@@ -76,6 +82,19 @@ func (c *Config) validate() error {
 	}
 	if c.LeakTimeout <= 0 {
 		c.LeakTimeout = 30 * time.Minute
+	}
+	// 新增默认值
+	if c.PingInterval <= 0 {
+		c.PingInterval = 10 * time.Second
+	}
+	if c.MaxPingsOut <= 0 {
+		c.MaxPingsOut = 3
+	}
+	if c.MaxReconnects == 0 {
+		c.MaxReconnects = -1
+	}
+	if c.ReconnectWait <= 0 {
+		c.ReconnectWait = 500 * time.Millisecond
 	}
 	return nil
 }
@@ -216,29 +235,19 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	// 第一次尝试：仅在所有服务器都没有空闲连接时，才会进入拨号流程。
 	for _, s := range servers {
 		if pc := p.popIdle(s); pc != nil {
-			// 检查连接健康状态
-			if pc.Conn.IsClosed() {
-				p.safeCloseConn(pc.Conn)
+			// 检查连接健康状态（必须是 CONNECTED 且可快速 Flush 成功）
+			if pc.Conn.IsClosed() || pc.Conn.Status() != nats.CONNECTED {
+				p.hardCloseConn(pc.Conn)
 				continue
 			}
-			if !pc.healthy || !pc.Conn.IsConnected() {
-				// 不关闭，让其等待 NATS 自动重连；尝试放回原队列
-				p.mu.RLock()
-				idleCh := p.idles[s]
-				p.mu.RUnlock()
-				select {
-				case idleCh <- pc:
-					// 放回等待自愈
-				default:
-					// 放不回则优雅关闭释放资源
-					p.safeCloseConn(pc.Conn)
-				}
+			if err := pc.Conn.FlushTimeout(50 * time.Millisecond); err != nil {
+				p.hardCloseConn(pc.Conn)
 				continue
 			}
 
-			// 超龄连接直接 Drain 并重新拨号
+			// 超龄连接直接关闭并重新拨号
 			if p.cfg.MaxLife > 0 && time.Since(pc.born) > p.cfg.MaxLife {
-				p.safeCloseConn(pc.Conn)
+				p.hardCloseConn(pc.Conn)
 				zap.S().Debugf("连接超龄，丢弃并重拨: %s", s)
 				continue
 			}
@@ -392,7 +401,7 @@ func (p *Pool) Put(c *nats.Conn) {
 		select {
 		case old := <-idle:
 			if old != nil {
-				p.safeCloseConn(old.Conn)
+				p.hardCloseConn(old.Conn)
 			}
 		default:
 		}
@@ -409,13 +418,6 @@ func (p *Pool) Put(c *nats.Conn) {
 			p.hardCloseConn(c)
 			return
 		}
-	}
-}
-
-// 安全关闭连接
-func (p *Pool) safeCloseConn(c *nats.Conn) {
-	if c != nil && !c.IsClosed() {
-		c.Drain()
 	}
 }
 
@@ -437,7 +439,7 @@ func (p *Pool) Close() {
 	for _, ch := range p.idles {
 		close(ch)
 		for pc := range ch {
-			p.safeCloseConn(pc.Conn)
+			p.hardCloseConn(pc.Conn)
 		}
 	}
 	p.mu.Unlock()
@@ -445,7 +447,7 @@ func (p *Pool) Close() {
 	// 关闭所有借出连接
 	p.muBorrow.Lock()
 	for conn := range p.borrowedConns {
-		p.safeCloseConn(conn)
+		p.hardCloseConn(conn)
 	}
 	p.borrowedConns = nil
 	p.muBorrow.Unlock()
@@ -930,7 +932,7 @@ func (p *Pool) popIdle(addr string) *pooledConn {
 		// 快速健康检查
 		if pc.Conn.IsClosed() || !pc.healthy {
 			// 连接不健康，直接丢弃并尝试下一个
-			p.safeCloseConn(pc.Conn)
+			p.hardCloseConn(pc.Conn)
 			// 尝试再获取一个
 			select {
 			case pc2 := <-ch:
@@ -964,6 +966,10 @@ func maskURL(raw string) string {
 func (p *Pool) dial(addr string) (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Timeout(p.cfg.DialTimeout),
+		nats.PingInterval(p.cfg.PingInterval),
+		nats.MaxPingsOutstanding(p.cfg.MaxPingsOut),
+		nats.MaxReconnects(p.cfg.MaxReconnects),
+		nats.ReconnectWait(p.cfg.ReconnectWait),
 		nats.ConnectHandler(func(c *nats.Conn) {
 			zap.S().Debugf("Pool连接成功 → %s", maskURL(addr))
 			atomic.AddInt64(&p.metrics.SuccessfulDials, 1)
@@ -980,8 +986,6 @@ func (p *Pool) dial(addr string) (*nats.Conn, error) {
 		}),
 	}
 	opts = append(opts, p.cfg.NATSOpts...)
-	// 允许客户端内建自动重连，提升重启后的恢复概率
-	opts = append(opts, nats.MaxReconnects(-1), nats.ReconnectWait(500*time.Millisecond))
 	conn, err := nats.Connect(addr, opts...)
 	if err == nil {
 		// 成功拨号，健康分快速恢复
@@ -997,6 +1001,10 @@ func (p *Pool) dial(addr string) (*nats.Conn, error) {
 func (p *Pool) dialWithTimeout(addr string, timeout time.Duration) (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Timeout(timeout),
+		nats.PingInterval(p.cfg.PingInterval),
+		nats.MaxPingsOutstanding(p.cfg.MaxPingsOut),
+		nats.MaxReconnects(p.cfg.MaxReconnects),
+		nats.ReconnectWait(p.cfg.ReconnectWait),
 		nats.ConnectHandler(func(c *nats.Conn) {
 			zap.S().Debugf("Pool连接成功 → %s", maskURL(addr))
 			atomic.AddInt64(&p.metrics.SuccessfulDials, 1)
@@ -1013,7 +1021,6 @@ func (p *Pool) dialWithTimeout(addr string, timeout time.Duration) (*nats.Conn, 
 		}),
 	}
 	opts = append(opts, p.cfg.NATSOpts...)
-	opts = append(opts, nats.MaxReconnects(-1), nats.ReconnectWait(500*time.Millisecond))
 	conn, err := nats.Connect(addr, opts...)
 	if err == nil {
 		// 成功拨号，健康分快速恢复
