@@ -213,7 +213,7 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	servers := p.serversByHealth()
 	var lastErr error
 
-	// 第一次尝试：健康度排序后依次取
+	// 第一次尝试：仅在所有服务器都没有空闲连接时，才会进入拨号流程。
 	for _, s := range servers {
 		if pc := p.popIdle(s); pc != nil {
 			// 检查连接健康状态
@@ -239,14 +239,17 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			p.muBorrow.Unlock()
 			return pc.Conn, nil
 		}
+	}
 
-		// 根据上下文动态调整拨号超时，避免单次拨号超时大于整体等待
-		dialTimeout := p.cfg.DialTimeout
-		if deadline, ok := ctx.Deadline(); ok {
-			if remain := time.Until(deadline); remain > 0 && remain < dialTimeout {
-				dialTimeout = remain
-			}
+	// 没有可用的空闲连接 → 尝试按健康度拨号（优先最健康）。
+	// 根据上下文动态调整拨号超时，避免单次拨号超时大于整体等待
+	dialTimeout := p.cfg.DialTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remain := time.Until(deadline); remain > 0 && remain < dialTimeout {
+			dialTimeout = remain
 		}
+	}
+	for _, s := range servers {
 		conn, err := p.dialWithTimeout(s, dialTimeout)
 		if err == nil {
 			now := time.Now()
@@ -374,27 +377,9 @@ func (p *Pool) Put(c *nats.Conn) {
 	}:
 		return
 	default:
-		// 队列已满：尝试非阻塞替换最早闲置连接，避免阻塞导致死锁
-		select {
-		case old := <-idle:
-			if old != nil {
-				p.safeCloseConn(old.Conn)
-			}
-		default:
-		}
-		// 再次尝试非阻塞放回；若仍然无法放入则直接关闭，避免阻塞
-		select {
-		case idle <- &pooledConn{
-			Conn:    c,
-			born:    bornTime,
-			addr:    addr,
-			healthy: true,
-		}:
-			return
-		default:
-			p.safeCloseConn(c)
-			return
-		}
+		// 队列已满：保留已有闲置连接，直接关闭新归还的连接，减少池内抖动
+		p.safeCloseConn(c)
+		return
 	}
 }
 
@@ -906,11 +891,29 @@ func (p *Pool) popIdle(addr string) *pooledConn {
 			}
 		}
 
-		// 快速健康检查
-		if pc.Conn.IsClosed() || !pc.healthy {
-			// 连接不健康，直接丢弃并尝试下一个
-			p.safeCloseConn(pc.Conn)
-			// 尝试再获取一个
+		// 快速健康检查与自愈
+		if pc.Conn.IsClosed() {
+			// 已关闭，尝试获取下一个
+			select {
+			case pc2 := <-ch:
+				if pc2 != nil && pc2.Conn != nil {
+					return pc2
+				}
+				return nil
+			default:
+				return nil
+			}
+		}
+
+		if !pc.Conn.IsConnected() || !pc.healthy {
+			// 暂不可用：放回等待自动重连/健康恢复；若已满则关闭
+			select {
+			case ch <- pc:
+				// 放回队列等待恢复
+			default:
+				p.safeCloseConn(pc.Conn)
+			}
+			// 尝试获取下一个
 			select {
 			case pc2 := <-ch:
 				if pc2 != nil && pc2.Conn != nil {
