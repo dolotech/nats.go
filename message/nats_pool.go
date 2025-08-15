@@ -285,9 +285,12 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 		p.bumpFail(s)
 	}
 
-	// 全部失败 → 指数退避重试，直到 ctx 结束
+	// 全部失败 → 有限重试，避免无限重试导致连接风暴
 	back := p.cfg.BackoffMin
-	for {
+	maxRetries := 3 // 最多重试3次，避免连接风暴
+	retryCount := 0
+
+	for retryCount < maxRetries {
 		select {
 		case <-ctx.Done():
 			if lastErr == nil {
@@ -296,6 +299,7 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			return nil, lastErr
 		case <-time.After(back):
 			atomic.AddInt64(&p.metrics.RetryAttempts, 1)
+			retryCount++
 
 			// 指数退避 + 抖动
 			back = back * 2
@@ -331,6 +335,12 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			}
 		}
 	}
+
+	// 重试次数耗尽，返回最后的错误
+	if lastErr == nil {
+		lastErr = errors.New("natspool: 重试次数耗尽，所有服务器都不可用")
+	}
+	return nil, lastErr
 }
 
 // Put 将连接放回池中；如果池已满或连接已关闭则直接 Drain。
