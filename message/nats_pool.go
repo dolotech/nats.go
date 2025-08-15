@@ -235,12 +235,8 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	// 第一次尝试：仅在所有服务器都没有空闲连接时，才会进入拨号流程。
 	for _, s := range servers {
 		if pc := p.popIdle(s); pc != nil {
-			// 检查连接健康状态（必须是 CONNECTED 且可快速 Flush 成功）
+			// 检查连接健康状态（必须是 CONNECTED）
 			if pc.Conn.IsClosed() || pc.Conn.Status() != nats.CONNECTED {
-				p.hardCloseConn(pc.Conn)
-				continue
-			}
-			if err := pc.Conn.FlushTimeout(50 * time.Millisecond); err != nil {
 				p.hardCloseConn(pc.Conn)
 				continue
 			}
