@@ -222,6 +222,12 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 				continue
 			}
 
+			// 轻量活性探测：避免服务器已宕而连接暂未标记断开
+			if err := pc.Conn.FlushTimeout(50 * time.Millisecond); err != nil {
+				p.safeCloseConn(pc.Conn)
+				continue
+			}
+
 			// 超龄连接直接 Drain 并重新拨号
 			if p.cfg.MaxLife > 0 && time.Since(pc.born) > p.cfg.MaxLife {
 				p.safeCloseConn(pc.Conn)
@@ -342,7 +348,7 @@ func (p *Pool) Put(c *nats.Conn) {
 		addr = c.ConnectedUrl()
 	}
 	if addr == "" {
-		p.safeCloseConn(c)
+		p.hardCloseConn(c)
 		return
 	}
 
@@ -353,7 +359,7 @@ func (p *Pool) Put(c *nats.Conn) {
 	idle, ok := p.idles[addr]
 	p.mu.RUnlock()
 	if !ok {
-		p.safeCloseConn(c)
+		p.hardCloseConn(c)
 		return
 	}
 
@@ -377,8 +383,8 @@ func (p *Pool) Put(c *nats.Conn) {
 	}:
 		return
 	default:
-		// 队列已满：保留已有闲置连接，直接关闭新归还的连接，减少池内抖动
-		p.safeCloseConn(c)
+		// 队列已满：保留已有闲置，丢弃最新归还的连接，避免池内抖动
+		p.hardCloseConn(c)
 		return
 	}
 }
@@ -387,6 +393,13 @@ func (p *Pool) Put(c *nats.Conn) {
 func (p *Pool) safeCloseConn(c *nats.Conn) {
 	if c != nil && !c.IsClosed() {
 		c.Drain()
+	}
+}
+
+// 硬关闭：无需优雅 Drain，快速释放资源
+func (p *Pool) hardCloseConn(c *nats.Conn) {
+	if c != nil && !c.IsClosed() {
+		c.Close()
 	}
 }
 
@@ -891,29 +904,11 @@ func (p *Pool) popIdle(addr string) *pooledConn {
 			}
 		}
 
-		// 快速健康检查与自愈
-		if pc.Conn.IsClosed() {
-			// 已关闭，尝试获取下一个
-			select {
-			case pc2 := <-ch:
-				if pc2 != nil && pc2.Conn != nil {
-					return pc2
-				}
-				return nil
-			default:
-				return nil
-			}
-		}
-
-		if !pc.Conn.IsConnected() || !pc.healthy {
-			// 暂不可用：放回等待自动重连/健康恢复；若已满则关闭
-			select {
-			case ch <- pc:
-				// 放回队列等待恢复
-			default:
-				p.safeCloseConn(pc.Conn)
-			}
-			// 尝试获取下一个
+		// 快速健康检查
+		if pc.Conn.IsClosed() || !pc.healthy {
+			// 连接不健康，直接丢弃并尝试下一个
+			p.safeCloseConn(pc.Conn)
+			// 尝试再获取一个
 			select {
 			case pc2 := <-ch:
 				if pc2 != nil && pc2.Conn != nil {
