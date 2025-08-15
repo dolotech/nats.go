@@ -393,27 +393,9 @@ func (p *Pool) Put(c *nats.Conn) {
 	}:
 		return
 	default:
-		// 队列已满：尝试非阻塞替换最早闲置连接，避免阻塞导致死锁
-		select {
-		case old := <-idle:
-			if old != nil {
-				p.hardCloseConn(old.Conn)
-			}
-		default:
-		}
-		// 再次尝试非阻塞放回；若仍然无法放入则直接关闭，避免阻塞
-		select {
-		case idle <- &pooledConn{
-			Conn:    c,
-			born:    bornTime,
-			addr:    addr,
-			healthy: true,
-		}:
-			return
-		default:
-			p.hardCloseConn(c)
-			return
-		}
+		// 队列已满：保持已有连接，关闭新连接（避免过度连接波动）
+		p.hardCloseConn(c)
+		return
 	}
 }
 
