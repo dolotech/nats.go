@@ -3,6 +3,7 @@ package message
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -140,6 +141,11 @@ func TestSubscriberQueue(t *testing.T) {
 
 func TestServerDownRecovery(t *testing.T) {
 	s := runNATSServer(t)
+	t.Logf("initial server: %s", s.ClientURL())
+	initialPort := 0
+	if tcpAddr, ok := s.Addr().(*net.TCPAddr); ok {
+		initialPort = tcpAddr.Port
+	}
 	pool := newPool(t, s.ClientURL(), 0)
 
 	// 停服
@@ -147,13 +153,35 @@ func TestServerDownRecovery(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	if _, err := pool.Get(ctx); err == nil {
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+
+	var downErr error
+	for waitCtx.Err() == nil {
+		conn, err := pool.Get(ctx)
+		if err != nil {
+			downErr = err
+			break
+		}
+		// 仍然借到了连接，立即归还并等待下一次检测
+		pool.Put(conn)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if downErr == nil {
 		t.Fatalf("expected error when server down")
 	}
 
-	// 重启
-	s = runNATSServer(t)
-	defer s.Shutdown()
+	// 重启在同一端口，模拟真实生产环境
+	opts := test.DefaultTestOptions
+	if initialPort != 0 {
+		opts.Port = initialPort
+	} else {
+		opts.Port = -1
+	}
+	s = test.RunServer(&opts)
+	t.Cleanup(s.Shutdown)
+	t.Logf("restarted server: %s", s.ClientURL())
 
 	ctx2, c2 := context.WithTimeout(context.Background(), 3*time.Second)
 	defer c2()

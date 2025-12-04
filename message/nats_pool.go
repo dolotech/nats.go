@@ -148,6 +148,8 @@ type Pool struct {
 	borrowedConns map[*nats.Conn]*borrowedInfo
 	muBorrow      sync.RWMutex // 改为读写锁提高性能
 
+	connHealth sync.Map // map[*nats.Conn]*int32 ，1=健康 0=不可用
+
 	// 监控指标
 	metrics PoolMetrics
 }
@@ -240,7 +242,10 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 				p.hardCloseConn(pc.Conn)
 				continue
 			}
-
+			if !p.isConnHealthy(pc.Conn) {
+				p.hardCloseConn(pc.Conn)
+				continue
+			}
 			// 超龄连接直接关闭并重新拨号
 			if p.cfg.MaxLife > 0 && time.Since(pc.born) > p.cfg.MaxLife {
 				p.hardCloseConn(pc.Conn)
@@ -361,6 +366,10 @@ func (p *Pool) Put(c *nats.Conn) {
 	if c.IsClosed() {
 		return
 	}
+	if !p.isConnHealthy(c) {
+		p.hardCloseConn(c)
+		return
+	}
 
 	var addr string
 	if wasBorrowed && borrowInfo != nil {
@@ -411,7 +420,11 @@ func (p *Pool) Put(c *nats.Conn) {
 
 // 硬关闭：无需优雅 Drain，快速释放资源
 func (p *Pool) hardCloseConn(c *nats.Conn) {
-	if c != nil && !c.IsClosed() {
+	if c == nil {
+		return
+	}
+	p.connHealth.Delete(c)
+	if !c.IsClosed() {
 		c.Close()
 	}
 }
@@ -938,6 +951,33 @@ func (p *Pool) popIdle(addr string) *pooledConn {
 	}
 }
 
+func (p *Pool) setConnHealthy(conn *nats.Conn, healthy bool) {
+	if conn == nil {
+		return
+	}
+	val, loaded := p.connHealth.LoadOrStore(conn, new(int32))
+	state := val.(*int32)
+	if !loaded && !healthy {
+		atomic.StoreInt32(state, 0)
+		return
+	}
+	if healthy {
+		atomic.StoreInt32(state, 1)
+	} else {
+		atomic.StoreInt32(state, 0)
+	}
+}
+
+func (p *Pool) isConnHealthy(conn *nats.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	if val, ok := p.connHealth.Load(conn); ok {
+		return atomic.LoadInt32(val.(*int32)) == 1
+	}
+	return false
+}
+
 // maskURL 隐藏 URL 中的用户名/密码，避免日志泄露密钥
 func maskURL(raw string) string {
 	if raw == "" {
@@ -959,12 +999,23 @@ func (p *Pool) dial(addr string) (*nats.Conn, error) {
 		nats.MaxReconnects(p.cfg.MaxReconnects),
 		nats.ReconnectWait(p.cfg.ReconnectWait),
 		nats.ConnectHandler(func(c *nats.Conn) {
+			p.setConnHealthy(c, true)
 			zap.S().Debugf("Pool连接成功 → %s", maskURL(addr))
 			atomic.AddInt64(&p.metrics.SuccessfulDials, 1)
 		}),
-		nats.ReconnectHandler(func(c *nats.Conn) { zap.S().Debugf("Pool连接已重连 → %s", maskURL(addr)) }),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) { zap.S().Debugf("Pool连接断开: %v", maskURL(addr)) }),
-		nats.ClosedHandler(func(_ *nats.Conn) { zap.S().Debugf("Pool连接已关闭: %s", maskURL(addr)) }),
+		nats.ReconnectHandler(func(c *nats.Conn) {
+			p.setConnHealthy(c, true)
+			zap.S().Debugf("Pool连接已重连 → %s", maskURL(addr))
+		}),
+		nats.DisconnectErrHandler(func(c *nats.Conn, err error) {
+			p.setConnHealthy(c, false)
+			zap.S().Debugf("Pool连接断开: %v", maskURL(addr))
+		}),
+		nats.ClosedHandler(func(c *nats.Conn) {
+			p.setConnHealthy(c, false)
+			p.connHealth.Delete(c)
+			zap.S().Debugf("Pool连接已关闭: %s", maskURL(addr))
+		}),
 		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
 			if s != nil {
 				zap.S().Errorf("NATS错误: subject=%s, error=%v", s.Subject, err)
@@ -978,6 +1029,7 @@ func (p *Pool) dial(addr string) (*nats.Conn, error) {
 	if err == nil {
 		// 成功拨号，健康分快速恢复
 		p.recoverHealth(addr)
+		p.setConnHealthy(conn, true)
 	} else {
 		// 拨号失败，记录指标
 		atomic.AddInt64(&p.metrics.FailedDials, 1)
@@ -994,12 +1046,23 @@ func (p *Pool) dialWithTimeout(addr string, timeout time.Duration) (*nats.Conn, 
 		nats.MaxReconnects(p.cfg.MaxReconnects),
 		nats.ReconnectWait(p.cfg.ReconnectWait),
 		nats.ConnectHandler(func(c *nats.Conn) {
+			p.setConnHealthy(c, true)
 			zap.S().Debugf("Pool连接成功 → %s", maskURL(addr))
 			atomic.AddInt64(&p.metrics.SuccessfulDials, 1)
 		}),
-		nats.ReconnectHandler(func(c *nats.Conn) { zap.S().Debugf("Pool连接已重连 → %s", maskURL(addr)) }),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) { zap.S().Debugf("Pool连接断开: %v", maskURL(addr)) }),
-		nats.ClosedHandler(func(_ *nats.Conn) { zap.S().Debugf("Pool连接已关闭: %s", maskURL(addr)) }),
+		nats.ReconnectHandler(func(c *nats.Conn) {
+			p.setConnHealthy(c, true)
+			zap.S().Debugf("Pool连接已重连 → %s", maskURL(addr))
+		}),
+		nats.DisconnectErrHandler(func(c *nats.Conn, err error) {
+			p.setConnHealthy(c, false)
+			zap.S().Debugf("Pool连接断开: %v", maskURL(addr))
+		}),
+		nats.ClosedHandler(func(c *nats.Conn) {
+			p.setConnHealthy(c, false)
+			p.connHealth.Delete(c)
+			zap.S().Debugf("Pool连接已关闭: %s", maskURL(addr))
+		}),
 		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
 			if s != nil {
 				zap.S().Errorf("NATS错误: subject=%s, error=%v", s.Subject, err)
@@ -1013,6 +1076,7 @@ func (p *Pool) dialWithTimeout(addr string, timeout time.Duration) (*nats.Conn, 
 	if err == nil {
 		// 成功拨号，健康分快速恢复
 		p.recoverHealth(addr)
+		p.setConnHealthy(conn, true)
 	} else {
 		// 拨号失败，记录指标
 		atomic.AddInt64(&p.metrics.FailedDials, 1)

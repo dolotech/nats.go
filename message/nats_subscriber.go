@@ -18,7 +18,7 @@ import (
 
 // ----------------------------------------------------------------------------
 // 生产级别增强说明：
-// 1. 使用信号量池限制并发，防止 goroutine 无上限膨胀。
+// 1. 使用固定 worker 池 + 有界队列限制并发，防止 goroutine 无上限膨胀。
 // 2. 合理设置 PendingLimits 防止内存占用失控。
 // 3. Close() 等待所有异步 handler 完成，确保优雅退出。
 // 4. 订阅创建时立即设置 PendingLimits。
@@ -29,6 +29,7 @@ import (
 const (
 	defaultPendingMsgs  = 64 * 1024
 	defaultPendingBytes = 64 * 1024 * 1024
+	streamFlushEvery    = 32
 )
 
 type subscription struct {
@@ -37,15 +38,22 @@ type subscription struct {
 	handler nats.MsgHandler
 }
 
+type asyncJob struct {
+	subject string
+	handler nats.MsgHandler
+	msg     *nats.Msg
+}
+
 type Subscriber struct {
 	cancel context.CancelFunc
 	ctx    context.Context
 	Conn   *nats.Conn
 	config SubscriberConfig // 订阅者配置
 	closed atomic.Bool
-	wg     sync.WaitGroup // 同步订阅 msgLoop 追踪
+	wg     sync.WaitGroup // worker + msgLoop 追踪
 	tasks  sync.WaitGroup // 异步 handler 追踪
-	pool   chan struct{}  // 信号量池，用作并发控制
+
+	jobQueue chan asyncJob
 
 	// 新增：统计和监控 - 使用原子计数器
 	messagesReceived  int64
@@ -83,7 +91,7 @@ func DefaultSubscriberConfig() SubscriberConfig {
 	}
 }
 
-// NewSubscriber 新建 Subscriber，并通过信号量池限制异步处理并发度。
+// NewSubscriber 新建 Subscriber，并通过 worker 池限制异步处理并发度。
 func NewSubscriber(servers []string, opts ...nats.Option) (*Subscriber, error) {
 	return NewSubscriberWithConfig(servers, DefaultSubscriberConfig(), opts...)
 }
@@ -124,11 +132,21 @@ func NewSubscriberWithConfig(servers []string, config SubscriberConfig, opts ...
 	copy(s, servers)
 	rand.Shuffle(len(s), func(i, j int) { s[i], s[j] = s[j], s[i] })
 
+	queueSize := config.MaxWorkers * 4
+	if queueSize < config.MaxWorkers {
+		queueSize = config.MaxWorkers
+	}
+
 	sub := &Subscriber{
-		ctx:    ctx,
-		cancel: cancel,
-		pool:   make(chan struct{}, config.MaxWorkers),
-		config: config,
+		ctx:      ctx,
+		cancel:   cancel,
+		config:   config,
+		jobQueue: make(chan asyncJob, queueSize),
+	}
+
+	for i := 0; i < config.MaxWorkers; i++ {
+		sub.wg.Add(1)
+		go sub.workerLoop()
 	}
 
 	// 连接事件日志
@@ -260,15 +278,7 @@ func (s *Subscriber) SubscribeGo(subj string, h nats.MsgHandler) error {
 // wrap 为异步回调提供 panic 防护
 func (s *Subscriber) wrapgo(subj string, h nats.MsgHandler) nats.MsgHandler {
 	return func(m *nats.Msg) {
-		go func(msg *nats.Msg) {
-			defer func() {
-				if err := recover(); err != nil {
-					zap.S().Errorf("Err:%v\nSubject:%s\nStack:\n%s",
-						err, subj, debug.Stack())
-				}
-			}()
-			h(msg)
-		}(m)
+		s.enqueueJob(subj, h, m, false)
 	}
 }
 
@@ -289,36 +299,7 @@ func (s *Subscriber) SubscribeAndDrop(subj string, h nats.MsgHandler) error {
 // 为异步回调提供 panic 防护 + 并发限流。
 func (s *Subscriber) drop(subj string, h nats.MsgHandler) nats.MsgHandler {
 	return func(m *nats.Msg) {
-		atomic.AddInt64(&s.messagesReceived, 1)
-
-		// ① 先探测一下令牌可不可拿
-		select {
-		case s.pool <- struct{}{}:
-			// 立刻拿到令牌，正常流程
-		default:
-			// 探测失败 ⇒ 令牌池满，记录一次告警
-			atomic.AddInt64(&s.messagesDropped, 1)
-			zap.S().Warnf("令牌池满直接丢弃, subject=%s", subj)
-			return
-		}
-
-		s.tasks.Add(1)
-		atomic.AddInt64(&s.goroutineCount, 1)
-		go func() {
-			defer func() {
-				<-s.pool       // 归还令牌
-				s.tasks.Done() // 结束追踪
-				atomic.AddInt64(&s.goroutineCount, -1)
-				if err := recover(); err != nil {
-					atomic.AddInt64(&s.messagesFailed, 1)
-					stack := debug.Stack()
-					zap.S().Errorf("Err:%v\nSubject:%s\nStack:\n%s", err, subj, stack)
-				} else {
-					atomic.AddInt64(&s.messagesProcessed, 1)
-				}
-			}()
-			h(m)
-		}()
+		s.enqueueJob(subj, h, m, true)
 	}
 }
 
@@ -353,14 +334,92 @@ func (s *Subscriber) Close(ctx context.Context) error {
 // wrap 为异步回调提供 panic 防护
 func (s *Subscriber) wrap(subj string, h nats.MsgHandler) nats.MsgHandler {
 	return func(m *nats.Msg) {
-		defer func() {
-			if err := recover(); err != nil {
-				stack := debug.Stack()
-				zap.S().Errorf("Err:%v\nSubject:%s\nStack:\n%s", err, subj, stack)
-			}
-		}()
-		h(m)
+		if s.closed.Load() {
+			return
+		}
+		atomic.AddInt64(&s.messagesReceived, 1)
+		s.safeInvoke(subj, h, m)
 	}
+}
+
+func (s *Subscriber) enqueueJob(subj string, h nats.MsgHandler, m *nats.Msg, drop bool) {
+	if h == nil || m == nil || s.closed.Load() {
+		return
+	}
+	atomic.AddInt64(&s.messagesReceived, 1)
+
+	job := asyncJob{
+		subject: subj,
+		handler: h,
+		msg:     m,
+	}
+
+	s.tasks.Add(1)
+
+	if drop {
+		select {
+		case s.jobQueue <- job:
+			return
+		default:
+			s.tasks.Done()
+			atomic.AddInt64(&s.messagesDropped, 1)
+			zap.S().Warnf("处理队列已满直接丢弃, subject=%s", subj)
+			return
+		}
+	}
+
+	select {
+	case s.jobQueue <- job:
+	case <-s.ctx.Done():
+		s.tasks.Done()
+		atomic.AddInt64(&s.messagesDropped, 1)
+		zap.S().Warnf("subscriber上下文已关闭，丢弃 subject=%s", subj)
+	}
+}
+
+func (s *Subscriber) workerLoop() {
+	defer s.wg.Done()
+	for {
+		select {
+		case job := <-s.jobQueue:
+			s.processJob(job)
+		case <-s.ctx.Done():
+			for {
+				select {
+				case job := <-s.jobQueue:
+					s.processJob(job)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *Subscriber) processJob(job asyncJob) {
+	if job.handler == nil || job.msg == nil {
+		s.tasks.Done()
+		return
+	}
+	atomic.AddInt64(&s.goroutineCount, 1)
+	defer func() {
+		atomic.AddInt64(&s.goroutineCount, -1)
+		s.tasks.Done()
+	}()
+	s.safeInvoke(job.subject, job.handler, job.msg)
+}
+
+func (s *Subscriber) safeInvoke(subj string, h nats.MsgHandler, m *nats.Msg) {
+	defer func() {
+		if err := recover(); err != nil {
+			atomic.AddInt64(&s.messagesFailed, 1)
+			stack := debug.Stack()
+			zap.S().Errorf("Err:%v\nSubject:%s\nStack:\n%s", err, subj, stack)
+		} else {
+			atomic.AddInt64(&s.messagesProcessed, 1)
+		}
+	}()
+	h(m)
 }
 
 // msgLoop 用于同步订阅的顺序拉取处理。
@@ -508,19 +567,17 @@ func (s *streamResponseSender) Send(data []byte) error {
 			return errors.New("NATS连接不可用")
 		}
 
-		// 发送数据
 		if err := s.conn.Publish(s.inbox, data); err != nil {
 			zap.S().Errorf("发送流式响应失败: %v", err)
 			return err
 		}
 
-		// 强制刷新确保消息发送
-		if err := s.conn.Flush(); err != nil {
-			zap.S().Errorf("刷新NATS连接失败: %v", err)
-			return fmt.Errorf("消息发送后刷新失败: %w", err)
+		newCount := atomic.AddInt64(&s.sendCount, 1)
+		if newCount%streamFlushEvery == 0 {
+			if err := s.flushConn("流式批量刷新"); err != nil {
+				return err
+			}
 		}
-
-		atomic.AddInt64(&s.sendCount, 1)
 		return nil
 	}
 }
@@ -549,9 +606,7 @@ func (s *streamResponseSender) SendError(err error) error {
 		return publishErr
 	}
 
-	// 强制刷新确保错误信号发送
-	if flushErr := s.conn.Flush(); flushErr != nil {
-		zap.S().Errorf("刷新NATS连接失败: %v", flushErr)
+	if flushErr := s.flushConn("流式错误信号"); flushErr != nil {
 		s.close()
 		return fmt.Errorf("错误信号发送后刷新失败: %w", flushErr)
 	}
@@ -584,9 +639,7 @@ func (s *streamResponseSender) End() error {
 		return err
 	}
 
-	// 强制刷新确保结束信号发送
-	if flushErr := s.conn.Flush(); flushErr != nil {
-		zap.S().Errorf("刷新NATS连接失败: %v", flushErr)
+	if flushErr := s.flushConn("流式结束信号"); flushErr != nil {
 		s.close()
 		return fmt.Errorf("结束信号发送后刷新失败: %w", flushErr)
 	}
@@ -608,6 +661,14 @@ func (s *streamResponseSender) close() {
 // GetSendCount 获取发送次数（用于监控）
 func (s *streamResponseSender) GetSendCount() int64 {
 	return atomic.LoadInt64(&s.sendCount)
+}
+
+func (s *streamResponseSender) flushConn(reason string) error {
+	if err := s.conn.FlushTimeout(2 * time.Second); err != nil {
+		zap.S().Errorf("刷新NATS连接失败(%s): %v", reason, err)
+		return err
+	}
+	return nil
 }
 
 // StreamSubscribeHandler 流式订阅处理器 - 使用回调模式
