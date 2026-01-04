@@ -80,6 +80,52 @@ func TestConnectionReuseAndTTL(t *testing.T) {
 	}
 }
 
+func TestLeakDetectorClosesBorrowedConnAndPoolStillWorks(t *testing.T) {
+	s := runNATSServer(t)
+	cfg := Config{
+		Servers:        []string{s.ClientURL()},
+		IdlePerServer:  8,
+		LeakTimeout:    50 * time.Millisecond,
+		MaxConnections: 1,
+	}
+	pool, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	ctx := context.Background()
+	c, err := pool.Get(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// 故意不 Put，模拟借出不归还
+	time.Sleep(80 * time.Millisecond)
+
+	pool.detectAndCloseLeakedConnections(time.Now())
+
+	// 泄露检测应摘除借出记录，并关闭该连接
+	m := pool.GetMetrics()
+	if m.BorrowedConnections != 0 {
+		t.Fatalf("expected BorrowedConnections=0 after leak detection, got %d", m.BorrowedConnections)
+	}
+	if m.ConnectionLeaks < 1 {
+		t.Fatalf("expected ConnectionLeaks>=1 after leak detection, got %d", m.ConnectionLeaks)
+	}
+	if !c.IsClosed() {
+		t.Fatalf("expected leaked conn to be closed")
+	}
+
+	// 池应仍然可用：还能继续 Get/Put
+	ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c2, err := pool.Get(ctx2)
+	if err != nil {
+		t.Fatalf("get after leak detection: %v", err)
+	}
+	pool.Put(c2)
+}
+
 func TestConcurrentPublish(t *testing.T) {
 	s := runNATSServer(t)
 	pool := newPool(t, s.ClientURL(), 0)

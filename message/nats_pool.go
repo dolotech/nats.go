@@ -33,26 +33,37 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// publishFlushMax 用于发布类 API 的刷出上限：在网络抖动时给一点时间，但避免无限等待
+	publishFlushMax = 2 * time.Second
+	// requestPreFlushMax 用于请求类 API 的“预刷出/预飞检”：尽快发现连接不可用，避免傻等到业务 15s 超时
+	requestPreFlushMax = 250 * time.Millisecond
+)
+
 // ----------------------------------------------------------------------------
 // 配置结构
 // ----------------------------------------------------------------------------
 
 type Config struct {
-	Servers          []string      // 服务器地址列表  nats://user:pass@host:4222
-	IdlePerServer    int           // 每个节点最大闲置连接数，默认 16
-	MinIdlePerServer int           // 每个节点最小保活闲置连接数，默认 4
-	DialTimeout      time.Duration // 单次拨号超时，默认 5s
-	MaxLife          time.Duration // 连接最大存活时间，0 表示不限
-	BackoffMin       time.Duration // 所有节点暂时不可用时的首次退避，默认 500ms
-	BackoffMax       time.Duration // 退避上限，默认 15s
-	LeakTimeout      time.Duration // 连接泄露检测超时，默认 30分钟
-	NATSOpts         []nats.Option // 额外的 nats 连接配置（TLS / 认证等）
+	Servers           []string      // 服务器地址列表  nats://user:pass@host:4222
+	IdlePerServer     int           // 每个节点最大闲置连接数，默认 16
+	MinIdlePerServer  int           // 每个节点最小保活闲置连接数，默认 4
+	MaxConnections    int           // 最大总连接数（活连接数），默认 128，防止资源耗尽
+	DialTimeout       time.Duration // 单次拨号超时，默认 5s
+	MaxLife           time.Duration // 连接最大存活时间，0 表示不限
+	BackoffMin        time.Duration // 所有节点暂时不可用时的首次退避，默认 500ms
+	BackoffMax        time.Duration // 退避上限，默认 15s
+	LeakTimeout       time.Duration // 连接泄露检测超时，默认 30分钟
+	LeakCheckInterval time.Duration // 泄露检测扫描间隔，默认 5分钟
+	NATSOpts          []nats.Option // 额外的 nats 连接配置（TLS / 认证等）
 
 	// 新增：保活与重连参数（与 Subscriber 保持一致的合理默认值）
 	PingInterval  time.Duration // 默认 10s
 	MaxPingsOut   int           // 默认 3
 	MaxReconnects int           // 默认 -1 (无限重连)
 	ReconnectWait time.Duration // 默认 500ms（连接池更积极）
+
+	AcquireTimeout time.Duration // Get 获取连接的默认超时（仅当 ctx 无 deadline 时生效），默认 15s
 }
 
 func (c *Config) validate() error {
@@ -71,6 +82,9 @@ func (c *Config) validate() error {
 	if c.MinIdlePerServer > c.IdlePerServer {
 		c.MinIdlePerServer = c.IdlePerServer
 	}
+	if c.MaxConnections <= 0 {
+		c.MaxConnections = 128
+	}
 	if c.DialTimeout <= 0 {
 		c.DialTimeout = 5 * time.Second
 	}
@@ -82,6 +96,9 @@ func (c *Config) validate() error {
 	}
 	if c.LeakTimeout <= 0 {
 		c.LeakTimeout = 30 * time.Minute
+	}
+	if c.LeakCheckInterval <= 0 {
+		c.LeakCheckInterval = 5 * time.Minute
 	}
 	// 新增默认值
 	if c.PingInterval <= 0 {
@@ -95,6 +112,9 @@ func (c *Config) validate() error {
 	}
 	if c.ReconnectWait <= 0 {
 		c.ReconnectWait = 500 * time.Millisecond
+	}
+	if c.AcquireTimeout <= 0 {
+		c.AcquireTimeout = 15 * time.Second
 	}
 	return nil
 }
@@ -141,14 +161,19 @@ type Pool struct {
 	idles  map[string]chan *pooledConn // 每个服务器的闲置连接列表
 	health map[string]*int64           // 节点健康分（0 = 健康，100 = 最差）
 
-	mu     sync.RWMutex
-	closed atomic.Bool
+	mu      sync.RWMutex
+	closed  atomic.Bool
+	closeCh chan struct{} // 关闭信号，确保后台 goroutine 可及时退出
 
 	// 优化的借出连接追踪
 	borrowedConns map[*nats.Conn]*borrowedInfo
 	muBorrow      sync.RWMutex // 改为读写锁提高性能
 
 	connHealth sync.Map // map[*nats.Conn]*int32 ，1=健康 0=不可用
+
+	// 最大连接数控制：信号量代表“活连接数”，只在真正关闭连接时释放
+	connSemaphore chan struct{}
+	liveConns     sync.Map // map[*nats.Conn]struct{}，用于防止重复释放信号量
 
 	// 监控指标
 	metrics PoolMetrics
@@ -165,6 +190,8 @@ func New(cfg Config) (*Pool, error) {
 		idles:         make(map[string]chan *pooledConn, len(cfg.Servers)),
 		health:        make(map[string]*int64, len(cfg.Servers)),
 		borrowedConns: make(map[*nats.Conn]*borrowedInfo),
+		closeCh:       make(chan struct{}),
+		connSemaphore: make(chan struct{}, cfg.MaxConnections),
 	}
 
 	for _, s := range cfg.Servers {
@@ -174,11 +201,18 @@ func New(cfg Config) (*Pool, error) {
 
 		// 预热最小闲置连接
 		for i := 0; i < cfg.MinIdlePerServer; i++ {
+			// 预热也要遵守最大连接数限制
+			if err := p.acquireConnSlot(context.Background()); err != nil {
+				zap.S().Warnf("预热连接获取信号量失败: %v", err)
+				break
+			}
 			conn, err := p.dial(s)
 			if err != nil {
 				zap.S().Warnf("预热连接失败: %v", err)
+				p.releaseConnSlot()
 				break
 			}
+			p.trackLiveConn(conn)
 			p.idles[s] <- &pooledConn{
 				Conn:    conn,
 				born:    time.Now(),
@@ -231,6 +265,12 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 	if p.closed.Load() {
 		return nil, errors.New("natspool: 已关闭")
 	}
+	// 仅当调用方未设置超时时，才加默认 AcquireTimeout
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.cfg.AcquireTimeout)
+		defer cancel()
+	}
 	servers := p.serversByHealth()
 	var lastErr error
 
@@ -274,9 +314,14 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 		}
 	}
 	for _, s := range servers {
+		// 每次尝试拨号前获取一个“活连接槽位”，避免跑久了资源耗尽
+		if err := p.acquireConnSlot(ctx); err != nil {
+			return nil, err
+		}
 		conn, err := p.dialWithTimeout(s, dialTimeout)
 		if err == nil {
 			now := time.Now()
+			p.trackLiveConn(conn) // 成功建立活连接，槽位由该连接持有，直到关闭才释放
 			p.muBorrow.Lock()
 			p.borrowedConns[conn] = &borrowedInfo{
 				borrowTime: now,
@@ -287,6 +332,8 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 			return conn, nil
 		}
 		lastErr = err
+		// 拨号失败：释放刚获取的槽位（没有产生连接）
+		p.releaseConnSlot()
 		p.bumpFail(s)
 	}
 
@@ -323,9 +370,13 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 						dialTimeout = remain
 					}
 				}
+				if err := p.acquireConnSlot(ctx); err != nil {
+					return nil, err
+				}
 				conn, err := p.dialWithTimeout(s, dialTimeout)
 				if err == nil {
 					now := time.Now()
+					p.trackLiveConn(conn)
 					p.muBorrow.Lock()
 					p.borrowedConns[conn] = &borrowedInfo{
 						borrowTime: now,
@@ -336,6 +387,7 @@ func (p *Pool) Get(ctx context.Context) (*nats.Conn, error) {
 					return conn, nil
 				}
 				lastErr = err
+				p.releaseConnSlot()
 				p.bumpFail(s)
 			}
 		}
@@ -364,6 +416,8 @@ func (p *Pool) Put(c *nats.Conn) {
 
 	// 检查连接状态
 	if c.IsClosed() {
+		// 连接可能被外部关闭：仍需释放槽位
+		p.releaseConnSlotForConn(c)
 		return
 	}
 	if !p.isConnHealthy(c) {
@@ -427,6 +481,8 @@ func (p *Pool) hardCloseConn(c *nats.Conn) {
 	if !c.IsClosed() {
 		c.Close()
 	}
+	// 无论是否已经 closed，只要该 conn 曾占用槽位，就释放一次
+	p.releaseConnSlotForConn(c)
 }
 
 // Close 关闭所有闲置 & 已借出连接，并使池失效。
@@ -434,6 +490,8 @@ func (p *Pool) Close() {
 	if p.closed.Swap(true) {
 		return
 	}
+	// 通知后台 goroutine 退出（必须只关闭一次）
+	close(p.closeCh)
 
 	p.mu.Lock()
 	// 关闭所有闲置连接
@@ -459,8 +517,15 @@ func (p *Pool) startMetricsCollector() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for !p.closed.Load() {
-		<-ticker.C
+	for {
+		select {
+		case <-p.closeCh:
+			return
+		case <-ticker.C:
+		}
+		if p.closed.Load() {
+			return
+		}
 		metrics := p.GetMetrics()
 		zap.S().Debugf("连接指标:\n空闲连接数=%d\n, 借出连接数=%d\n, 总连接数=%d\n, 成功拨号数=%d\n, 失败拨号数=%d\n, 连接泄露数=%d\n, 重试次数=%d\n",
 			metrics.IdleConnections,
@@ -474,17 +539,67 @@ func (p *Pool) startMetricsCollector() {
 	}
 }
 
+func (p *Pool) ensureConnReady(c *nats.Conn) error {
+	if c == nil {
+		return errors.New("natspool: nil conn")
+	}
+	if c.IsClosed() {
+		return errors.New("natspool: conn 已关闭")
+	}
+	// 注意：即使 IsConnected 为 true，也可能处于短暂抖动；Status 更准确
+	if c.Status() != nats.CONNECTED {
+		return fmt.Errorf("natspool: conn 非 CONNECTED (status=%v)", c.Status())
+	}
+	if !p.isConnHealthy(c) {
+		return errors.New("natspool: conn 不健康")
+	}
+	return nil
+}
+
+func ctxBoundTimeout(ctx context.Context, max time.Duration) (time.Duration, error) {
+	if max <= 0 {
+		return 0, errors.New("natspool: invalid timeout")
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return 0, ctx.Err()
+		}
+		if remain < max {
+			return remain, nil
+		}
+	}
+	return max, nil
+}
+
+func (p *Pool) flushBound(ctx context.Context, c *nats.Conn, max time.Duration) error {
+	to, err := ctxBoundTimeout(ctx, max)
+	if err != nil {
+		return err
+	}
+	return c.FlushTimeout(to)
+}
+
 func (p *Pool) PublishMsg(ctx context.Context, msg *nats.Msg) error {
 	nc, err := p.Get(ctx)
 	if err != nil {
 		return err
 	}
 	defer p.Put(nc)
-	if err := nc.PublishMsg(msg); err != nil {
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
 		return err
 	}
-	// 提升可靠性：确保消息尽快刷出
-	_ = nc.FlushTimeout(2 * time.Second)
+	if err := nc.PublishMsg(msg); err != nil {
+		// Publish 失败通常表示连接不可用，快速淘汰
+		p.hardCloseConn(nc)
+		return err
+	}
+	// 提升可靠性：确保消息尽快刷出（不再忽略错误，避免业务侧傻等 15s）
+	if err := p.flushBound(ctx, nc, publishFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return err
+	}
 	return nil
 }
 
@@ -499,21 +614,40 @@ func (p *Pool) Publish(ctx context.Context, subj string, data []byte) error {
 		return err
 	}
 	defer p.Put(nc)
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
+		return err
+	}
 	if err := nc.Publish(subj, data); err != nil {
+		p.hardCloseConn(nc)
 		return err
 	}
 	// 提升可靠性：确保消息尽快刷出
-	_ = nc.FlushTimeout(2 * time.Second)
+	if err := p.flushBound(ctx, nc, publishFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return err
+	}
 	return nil
 }
 
 // Request 请求 – 返回 Msg。
+// ctx 用于控制请求超时（默认15s）
+// 请求消息体为 *nats.Msg，而不是 []byte
 func (p *Pool) RequestMsg(ctx context.Context, msg *nats.Msg) (*nats.Msg, error) {
 	nc, err := p.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer p.Put(nc)
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
+		return nil, err
+	}
+	// 预刷出：尽早发现连接不可用（典型表现就是业务侧固定 15s 超时）
+	if err := p.flushBound(ctx, nc, requestPreFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return nil, err
+	}
 	return nc.RequestMsgWithContext(ctx, msg)
 }
 
@@ -524,15 +658,23 @@ func (p *Pool) PublishAny(ctx context.Context, subj string, v any) error {
 		return err
 	}
 	defer p.Put(nc)
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
+		return err
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 	if err := nc.Publish(subj, b); err != nil {
+		p.hardCloseConn(nc)
 		return err
 	}
 	// 提升可靠性：确保消息尽快刷出
-	_ = nc.FlushTimeout(2 * time.Second)
+	if err := p.flushBound(ctx, nc, publishFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return err
+	}
 	return nil
 }
 
@@ -543,8 +685,15 @@ func (p *Pool) Request(ctx context.Context, subj string, data []byte) (*nats.Msg
 		return nil, err
 	}
 	defer p.Put(nc)
-	// 先确保前序写入刷出，提高请求可用性
-	_ = nc.FlushTimeout(2 * time.Second)
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
+		return nil, err
+	}
+	// 预刷出：尽早发现连接不可用
+	if err := p.flushBound(ctx, nc, requestPreFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return nil, err
+	}
 	return nc.RequestWithContext(ctx, subj, data)
 }
 
@@ -555,13 +704,20 @@ func (p *Pool) RequestAny(ctx context.Context, subj string, v any) (*nats.Msg, e
 		return nil, err
 	}
 	defer p.Put(nc)
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
+		return nil, err
+	}
 
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
-	// 先确保前序写入刷出，提高请求可用性
-	_ = nc.FlushTimeout(2 * time.Second)
+	// 预刷出：尽早发现连接不可用
+	if err := p.flushBound(ctx, nc, requestPreFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return nil, err
+	}
 	return nc.RequestWithContext(ctx, subj, b)
 }
 
@@ -577,6 +733,10 @@ func (p *Pool) StreamRequest(ctx context.Context, subject string, requestData []
 		return err
 	}
 	defer p.Put(nc)
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
+		return err
+	}
 
 	// 创建收件箱用于接收流式响应
 	inbox := nats.NewInbox()
@@ -599,7 +759,13 @@ func (p *Pool) StreamRequest(ctx context.Context, subject string, requestData []
 	}
 
 	if err := nc.PublishMsg(msg); err != nil {
+		p.hardCloseConn(nc)
 		return fmt.Errorf("发送流式请求失败: %v", err)
+	}
+	// 预刷出：避免请求没发出去，客户端一直等到 ctx 超时
+	if err := p.flushBound(ctx, nc, requestPreFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return fmt.Errorf("发送流式请求后刷新失败: %v", err)
 	}
 
 	zap.S().Infof("发起流式请求: subject=%s, inbox=%s", subject, inbox)
@@ -670,6 +836,10 @@ func (p *Pool) StreamRequestWithTimeout(ctx context.Context, subject string, req
 		return err
 	}
 	defer p.Put(nc)
+	if err := p.ensureConnReady(nc); err != nil {
+		p.hardCloseConn(nc)
+		return err
+	}
 
 	// 创建收件箱
 	inbox := nats.NewInbox()
@@ -691,7 +861,12 @@ func (p *Pool) StreamRequestWithTimeout(ctx context.Context, subject string, req
 	}
 
 	if err := nc.PublishMsg(msg); err != nil {
+		p.hardCloseConn(nc)
 		return fmt.Errorf("发送流式请求失败: %v", err)
+	}
+	if err := p.flushBound(streamCtx, nc, requestPreFlushMax); err != nil {
+		p.hardCloseConn(nc)
+		return fmt.Errorf("发送流式请求后刷新失败: %v", err)
 	}
 
 	zap.S().Infof("发起带超时的流式请求: subject=%s, 请求超时=%v, 流式超时=%v", subject, requestTimeout, streamTimeout)
@@ -1137,20 +1312,98 @@ func (p *Pool) serversByHealth() []string {
 }
 
 func (p *Pool) startLeakDetector() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(p.cfg.LeakCheckInterval)
 	defer ticker.Stop()
-	for !p.closed.Load() {
-		<-ticker.C
-		p.muBorrow.Lock()
-		now := time.Now()
-		for conn, since := range p.borrowedConns {
-			if now.Sub(since.borrowTime) > p.cfg.LeakTimeout { // 连接泄露检测超时
-				zap.S().Warnf("连接泄漏: %s (borrowed at %s)", maskURL(conn.ConnectedUrl()), since.borrowTime.Format(time.RFC3339))
-				atomic.AddInt64(&p.metrics.ConnectionLeaks, 1)
-				conn.Close()
-				delete(p.borrowedConns, conn)
-			}
+	for {
+		select {
+		case <-p.closeCh:
+			return
+		case <-ticker.C:
 		}
-		p.muBorrow.Unlock()
+		if p.closed.Load() {
+			return
+		}
+		p.detectAndCloseLeakedConnections(time.Now())
+	}
+}
+
+func (p *Pool) acquireConnSlot(ctx context.Context) error {
+	select {
+	case p.connSemaphore <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *Pool) releaseConnSlot() {
+	select {
+	case <-p.connSemaphore:
+	default:
+		// 逻辑错误：出现重复释放/未获取先释放；这里不 panic，打日志便于线上定位
+		zap.S().Warnf("连接槽位释放异常：可能重复释放或未获取先释放")
+	}
+}
+
+func (p *Pool) trackLiveConn(c *nats.Conn) {
+	if c == nil {
+		return
+	}
+	p.liveConns.Store(c, struct{}{})
+}
+
+func (p *Pool) releaseConnSlotForConn(c *nats.Conn) {
+	if c == nil {
+		return
+	}
+	if _, loaded := p.liveConns.LoadAndDelete(c); loaded {
+		p.releaseConnSlot()
+	}
+}
+
+type leakedConn struct {
+	conn       *nats.Conn
+	borrowTime time.Time
+	addr       string
+}
+
+// detectAndCloseLeakedConnections 扫描并关闭超时未归还的借出连接。
+// 关键点：不能在持有 muBorrow 锁的情况下执行 Close/Drain 等潜在阻塞操作。
+func (p *Pool) detectAndCloseLeakedConnections(now time.Time) {
+	if p.cfg.LeakTimeout <= 0 {
+		return
+	}
+
+	var leaked []leakedConn
+
+	p.muBorrow.Lock()
+	for conn, info := range p.borrowedConns {
+		if info == nil {
+			continue
+		}
+		if now.Sub(info.borrowTime) > p.cfg.LeakTimeout {
+			// 先从追踪表中删除，避免后续 Put/重复检测产生混乱
+			delete(p.borrowedConns, conn)
+			atomic.AddInt64(&p.metrics.ConnectionLeaks, 1)
+			leaked = append(leaked, leakedConn{
+				conn:       conn,
+				borrowTime: info.borrowTime,
+				addr:       info.addr,
+			})
+		}
+	}
+	p.muBorrow.Unlock()
+
+	for _, it := range leaked {
+		// 记录尽可能多的信息（ConnectedUrl 在断线/关闭后可能为空）
+		u := ""
+		if it.conn != nil {
+			u = maskURL(it.conn.ConnectedUrl())
+		}
+		if u == "" {
+			u = maskURL(it.addr)
+		}
+		zap.S().Warnf("连接泄漏: %s (borrowed at %s, leakTimeout=%s)", u, it.borrowTime.Format(time.RFC3339), p.cfg.LeakTimeout)
+		p.hardCloseConn(it.conn)
 	}
 }

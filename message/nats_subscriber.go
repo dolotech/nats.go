@@ -54,6 +54,7 @@ type Subscriber struct {
 	tasks  sync.WaitGroup // 异步 handler 追踪
 
 	jobQueue chan asyncJob
+	streamSem chan struct{} // 流式回调处理并发限制，避免 goroutine 无上限膨胀
 
 	// 新增：统计和监控 - 使用原子计数器
 	messagesReceived  int64
@@ -72,6 +73,7 @@ type SubscriberConfig struct {
 	MaxWorkers    int           // 最大并发工作者数量，默认为 GOMAXPROCS * 32
 	PendingMsgs   int           // 每个订阅的消息缓冲区大小，默认 64K
 	PendingBytes  int64         // 每个订阅的字节缓冲区大小，默认 64MB
+	MaxStreamJobs int           // 流式回调最大并发，默认 MaxWorkers
 	ReconnectWait time.Duration // 重连等待时间，默认 2秒
 	MaxReconnects int           // 最大重连次数，-1 表示无限重连
 	PingInterval  time.Duration // Ping间隔，默认 10秒
@@ -84,6 +86,7 @@ func DefaultSubscriberConfig() SubscriberConfig {
 		MaxWorkers:    runtime.GOMAXPROCS(0) * 32,
 		PendingMsgs:   64 * 1024,
 		PendingBytes:  64 * 1024 * 1024,
+		MaxStreamJobs: runtime.GOMAXPROCS(0) * 32,
 		ReconnectWait: 2 * time.Second,
 		MaxReconnects: -1,
 		PingInterval:  10 * time.Second,
@@ -111,6 +114,9 @@ func NewSubscriberWithConfig(servers []string, config SubscriberConfig, opts ...
 	}
 	if config.PendingBytes <= 0 {
 		config.PendingBytes = 64 * 1024 * 1024
+	}
+	if config.MaxStreamJobs <= 0 {
+		config.MaxStreamJobs = config.MaxWorkers
 	}
 	if config.ReconnectWait <= 0 {
 		config.ReconnectWait = 2 * time.Second
@@ -142,6 +148,7 @@ func NewSubscriberWithConfig(servers []string, config SubscriberConfig, opts ...
 		cancel:   cancel,
 		config:   config,
 		jobQueue: make(chan asyncJob, queueSize),
+		streamSem: make(chan struct{}, config.MaxStreamJobs),
 	}
 
 	for i := 0; i < config.MaxWorkers; i++ {
@@ -682,8 +689,29 @@ func (s *Subscriber) StreamSubscribeHandler(ctx context.Context, subject string,
 
 	// 订阅流式请求
 	sub, err := s.Conn.Subscribe(subject, func(m *nats.Msg) {
-		// 为每个请求启动独立的流式响应协程
-		go s.handleCallbackStreamRequest(ctx, m, handler)
+		// 为每个请求启动独立协程，但必须有限并发；否则线上跑久了会 goroutine 膨胀并拖垮整体延迟
+		if s.closed.Load() {
+			return
+		}
+		select {
+		case s.streamSem <- struct{}{}:
+			s.tasks.Add(1)
+			go func() {
+				defer func() {
+					<-s.streamSem
+					s.tasks.Done()
+				}()
+				s.handleCallbackStreamRequest(ctx, m, handler)
+			}()
+		default:
+			// 系统繁忙：立即返回错误，避免客户端一直等到 15s context deadline exceeded
+			atomic.AddInt64(&s.messagesDropped, 1)
+			if m != nil && m.Reply != "" {
+				_ = s.Conn.Publish(m.Reply, []byte("__STREAM_ERROR__:server busy"))
+				_ = s.Conn.FlushTimeout(200 * time.Millisecond)
+			}
+			zap.S().Warnf("流式请求被丢弃（并发已满）: subject=%s", subject)
+		}
 	})
 
 	if err != nil {
@@ -720,8 +748,27 @@ func (s *Subscriber) StreamQueueSubscribeHandler(ctx context.Context, subject, q
 
 	// 订阅流式请求
 	sub, err := s.Conn.QueueSubscribe(subject, queue, func(m *nats.Msg) {
-		// 为每个请求启动独立的流式响应协程
-		go s.handleCallbackStreamRequest(ctx, m, handler)
+		if s.closed.Load() {
+			return
+		}
+		select {
+		case s.streamSem <- struct{}{}:
+			s.tasks.Add(1)
+			go func() {
+				defer func() {
+					<-s.streamSem
+					s.tasks.Done()
+				}()
+				s.handleCallbackStreamRequest(ctx, m, handler)
+			}()
+		default:
+			atomic.AddInt64(&s.messagesDropped, 1)
+			if m != nil && m.Reply != "" {
+				_ = s.Conn.Publish(m.Reply, []byte("__STREAM_ERROR__:server busy"))
+				_ = s.Conn.FlushTimeout(200 * time.Millisecond)
+			}
+			zap.S().Warnf("流式队列请求被丢弃（并发已满）: subject=%s queue=%s", subject, queue)
+		}
 	})
 
 	if err != nil {
